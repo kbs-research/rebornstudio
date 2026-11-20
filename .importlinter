@@ -1,0 +1,76 @@
+# 워크스페이스 패키지 사이의 import 방향 계약이다.
+#
+# 도메인 경계(api_gateway 안쪽)는 apps/api-gateway/pyproject.toml이 갖는다.
+# 이 파일은 그보다 한 층 위, 배포 단위끼리의 방향만 막는다.
+# 한 패키지의 계약만 돌리면 다른 패키지가 그 패키지를 import하는 것이 안 보여서 여기 둔다.
+#
+# 실행: 저장소 루트에서 uv run --all-packages --group test lint-imports --config .importlinter
+# 테스트 폴더(apps/api-gateway/tests 등)는 루트 패키지 밖이라 검사하지 않는다.
+
+[importlinter]
+root_packages =
+    api_gateway
+    worker_io
+    worker_jobs
+    reborn_transcode
+    reborn_contracts
+
+# 변환 러너는 DB 없는 잡 러너다. 잡 페이로드만 받고 결과를 큐로 돌려준다.
+# api_gateway나 worker_io를 import하면 DB 설정과 도메인 코드가 변환 이미지에 딸려 들어간다.
+[importlinter:contract:transcode-standalone]
+name = 워크스페이스 — reborn_transcode는 api_gateway·worker_io·worker_jobs를 import하지 않는다
+type = forbidden
+source_modules =
+    reborn_transcode
+forbidden_modules =
+    api_gateway
+    worker_io
+    worker_jobs
+
+# 무DB 잡 워커는 잡 페이로드 하나로 일하고 결과를 큐로 회신한다.
+# api_gateway를 import하면 DB 설정과 도메인 코드가 잡 이미지에 딸려 들어가고,
+# worker_io를 import하면 그 경로로 api_gateway가 따라온다. 둘과는 태스크 이름으로만 이어진다.
+[importlinter:contract:jobs-standalone]
+name = 워크스페이스 — worker_jobs는 api_gateway·worker_io를 import하지 않는다
+type = forbidden
+source_modules =
+    worker_jobs
+forbidden_modules =
+    api_gateway
+    worker_io
+
+# worker-io는 무DB 잡을 태스크 이름으로 보낸다(reborn_contracts.queues). 잡 함수를 import하면
+# 잡 태스크가 worker-io 앱에도 등록되어 두 이미지가 같은 이름을 갖게 되고, 잡 이미지를
+# 따로 배포해도 옛 코드가 worker-io 쪽에서 돌 수 있다.
+[importlinter:contract:io-sends-jobs-by-name]
+name = 워크스페이스 — worker_io는 worker_jobs를 import하지 않는다
+type = forbidden
+source_modules =
+    worker_io
+forbidden_modules =
+    worker_jobs
+
+# 계약 패키지는 서버·워커·변환 러너가 모두 import하는 바닥이다.
+# 위쪽을 import하면 순환이 생기고, 변환 러너처럼 가벼운 이미지에 서버 코드가 딸려 들어간다.
+[importlinter:contract:contracts-bottom]
+name = 워크스페이스 — reborn_contracts는 다른 워크스페이스 패키지를 import하지 않는다
+type = forbidden
+source_modules =
+    reborn_contracts
+forbidden_modules =
+    api_gateway
+    worker_io
+    worker_jobs
+    reborn_transcode
+
+# 의존 방향은 워커 → API 서버 한쪽이다. 서버가 워커를 import하면 Celery 앱과 태스크 등록이
+# 서버 프로세스에 딸려 들어가고, 두 이미지를 따로 배포할 수 없게 된다.
+# 서버 테스트 몇 개가 worker_io를 import하지만 테스트 폴더는 이 계약으로 검사하지 않는다.
+[importlinter:contract:gateway-not-worker]
+name = 워크스페이스 — api_gateway는 worker_io·worker_jobs를 import하지 않는다
+type = forbidden
+source_modules =
+    api_gateway
+forbidden_modules =
+    worker_io
+    worker_jobs

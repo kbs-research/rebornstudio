@@ -1,0 +1,125 @@
+{
+  "$comment": "연결 수정이 시크릿을 다시 받아야 하는지 정하는 판정 표다. 서버(연결 수정 422)와 화면(키 칸 필수 표시)이 같은 답을 내는지 양쪽 테스트가 이 파일을 읽어 확인한다. 값을 손으로 고치지 말고 두 구현을 고친 뒤 다시 맞춘다.",
+  "rule": "저장된 시크릿이 있고, 같은 요청에 시크릿을 보내지 않고, 시크릿을 지우지도 않는데, 연결 종류의 주소 키 값이 하나라도 바뀌면 시크릿을 다시 받는다. 값 비교는 앞뒤 공백을 지우고 빈 값과 없는 값을 같게 보며, base_url·endpoint는 끝 슬래시를 무시한다.",
+  "implementations": {
+    "server": "apps/api-gateway/api_gateway/services/stacks/connections.py (ROUTING_KEYS · secret_required)",
+    "web": "apps/web/src/features/platform/lib/connection_address.ts (ROUTING_KEYS · secretRequired)"
+  },
+  "routing_keys": {
+    "s3": ["endpoint", "region"],
+    "ncp": ["endpoint", "region"],
+    "gcs": ["endpoint", "region"],
+    "maiu": ["base_url"],
+    "openai": ["base_url"],
+    "anthropic": ["base_url"],
+    "local-llm": ["base_url"],
+    "bedrock": ["region"]
+  },
+  "cases": [
+    {
+      "why": "저장소 엔드포인트만 바꾸면 시크릿을 다시 받는다",
+      "provider": "ncp", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"endpoint": "https://kr.object.ncloudstorage.com", "bucket": "sample-bucket", "region": "kr-standard"},
+      "after": {"endpoint": "https://other.example", "bucket": "sample-bucket", "region": "kr-standard"},
+      "required": true
+    },
+    {
+      "why": "저장소 리전만 바꿔도 시크릿을 다시 받는다. 엔드포인트가 비면 리전이 호스트를 정한다",
+      "provider": "s3", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"bucket": "sample-bucket", "region": "ap-northeast-2"},
+      "after": {"bucket": "sample-bucket", "region": "us-east-1"},
+      "required": true
+    },
+    {
+      "why": "주소와 시크릿을 같은 요청에 보내면 통과한다",
+      "provider": "ncp", "has_secret": true, "secret_sent": true, "clear_secret": false,
+      "before": {"endpoint": "https://a.example", "bucket": "sample-bucket"},
+      "after": {"endpoint": "https://b.example", "bucket": "sample-bucket"},
+      "required": false
+    },
+    {
+      "why": "같은 주소를 다시 보내면 바꾼 것이 아니다",
+      "provider": "ncp", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"endpoint": "https://a.example", "bucket": "sample-bucket", "region": "kr-standard"},
+      "after": {"endpoint": "https://a.example", "bucket": "sample-bucket", "region": "kr-standard"},
+      "required": false
+    },
+    {
+      "why": "끝 슬래시와 앞뒤 공백만 다르면 같은 주소다",
+      "provider": "openai", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"model": "m", "base_url": "https://api.openai.com/v1"},
+      "after": {"model": "m", "base_url": " https://api.openai.com/v1/ "},
+      "required": false
+    },
+    {
+      "why": "주소가 아닌 값만 바꾸면 시크릿을 다시 받지 않는다",
+      "provider": "ncp", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"endpoint": "https://a.example", "bucket": "sample-bucket"},
+      "after": {"endpoint": "https://a.example", "bucket": "sample-bucket-2", "allowed_buckets": ["sample-bucket-2", "sample-bucket-3"]},
+      "required": false
+    },
+    {
+      "why": "저장된 시크릿이 없으면 새 주소로 나갈 시크릿이 없다",
+      "provider": "ncp", "has_secret": false, "secret_sent": false, "clear_secret": false,
+      "before": {"endpoint": "https://a.example"},
+      "after": {"endpoint": "https://b.example"},
+      "required": false
+    },
+    {
+      "why": "시크릿을 지우면서 주소를 바꾸면 통과한다",
+      "provider": "maiu", "has_secret": true, "secret_sent": false, "clear_secret": true,
+      "before": {"base_url": "https://mi.apigw.ntruss.com", "workspace_name": "w"},
+      "after": {"base_url": "https://mi.other.example", "workspace_name": "w"},
+      "required": false
+    },
+    {
+      "why": "MI API 주소를 바꾸면 시크릿을 다시 받는다. 서명에 호스트가 들어가지 않아 받은 서명을 실제 서비스에 다시 쓸 수 있다",
+      "provider": "maiu", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"base_url": "https://mi.apigw.ntruss.com", "workspace_name": "w"},
+      "after": {"base_url": "https://mi.other.example", "workspace_name": "w"},
+      "required": true
+    },
+    {
+      "why": "비어 있던 API 주소를 채우면 공식 주소에서 다른 주소로 바뀐다",
+      "provider": "openai", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"model": "m"},
+      "after": {"model": "m", "base_url": "https://proxy.example/v1"},
+      "required": true
+    },
+    {
+      "why": "API 주소를 지우면 공식 주소로 바뀐다",
+      "provider": "local-llm", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"model": "m", "base_url": "http://10.0.0.5:8000/v1"},
+      "after": {"model": "m"},
+      "required": true
+    },
+    {
+      "why": "Bedrock 리전을 바꾸면 시크릿을 다시 받는다",
+      "provider": "bedrock", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"region": "us-east-1", "model": "m"},
+      "after": {"region": "us-west-2", "model": "m"},
+      "required": true
+    },
+    {
+      "why": "Anthropic의 API 주소도 품질검수 호출이 쓴다",
+      "provider": "anthropic", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"model": "m"},
+      "after": {"model": "m", "base_url": "https://proxy.example"},
+      "required": true
+    },
+    {
+      "why": "모델만 바꾸면 시크릿을 다시 받지 않는다",
+      "provider": "bedrock", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"region": "us-east-1", "model": "a"},
+      "after": {"region": "us-east-1", "model": "b"},
+      "required": false
+    },
+    {
+      "why": "모델 공급자에 리전 키가 생겨도 요청이 나가는 곳이 아니다",
+      "provider": "openai", "has_secret": true, "secret_sent": false, "clear_secret": false,
+      "before": {"model": "m"},
+      "after": {"model": "m", "region": "x"},
+      "required": false
+    }
+  ]
+}

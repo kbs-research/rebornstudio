@@ -1,0 +1,27 @@
+# web nginx 보안 응답 헤더의 템플릿. web-nginx.conf의 server 블록과 add_header를 쓰는 location이 include한다.
+#
+# 컨테이너 시작 스크립트(web-csp.sh)가 CSP 줄의 자리표시 세 곳에 저장소 출처 목록을 넣어
+# /etc/nginx/generated/security-headers.conf를 만든다. 이미지 빌드도 기본값으로 한 번 만들어 둔다.
+#
+# nginx는 location에 add_header가 하나라도 있으면 server 수준 add_header를 상속하지 않는다.
+# 그래서 add_header를 더한 location에는 이 파일도 같이 include한다. 빠지면 그 경로만 헤더가 없다.
+# always는 404·5xx 응답에도 헤더를 붙인다.
+
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+# CSP는 강제 모드다. 정책 밖의 자원은 브라우저가 막는다. 출처마다 연 이유는 아래와 같다.
+# 스크립트는 같은 출처의 번들 파일만 받는다. index.html에 인라인 스크립트가 없고 번들에 eval이 없다.
+# 스타일은 인라인을 연다. 영상 플레이어(vidstack)가 큐와 컨트롤에 style 속성 문자열을 넣는다.
+# 글꼴은 data:를 연다. 빌드가 작은 글꼴 파일을 CSS 안의 data: 주소로 넣는다.
+# 영상·썸네일·첨부는 저장소 presigned 주소로 받고 업로드와 이미지 저장도 그 주소로 보낸다.
+# 그래서 img-src·media-src·connect-src에 저장소 출처(배포 설정 CSP_STORAGE_ORIGINS)를 연다.
+# 저장소 엔드포인트가 http면 이 정책이 막으므로 연결의 엔드포인트는 https로 쓴다.
+# media-src의 blob:은 업로드 전에 영상 길이를 읽는 video 요소가 쓴다.
+# 위반 보고는 같은 출처의 /api/csp-report로 보낸다. report-to를 아는 브라우저는 Reporting-Endpoints의
+# csp 끝점을 쓰고, 모르는 브라우저는 report-uri를 쓴다.
+# HSTS는 넣지 않는다. web은 TLS 없이 80만 열고, HSTS는 https 응답에서만 효과가 있다.
+add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: __CSP_STORAGE_ORIGINS__; media-src 'self' blob: __CSP_STORAGE_ORIGINS__; connect-src 'self' __CSP_STORAGE_ORIGINS__; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; report-uri /api/csp-report; report-to csp" always;
+add_header Reporting-Endpoints 'csp="/api/csp-report"' always;

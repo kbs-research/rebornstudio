@@ -1,0 +1,397 @@
+name: CI
+
+# 수동 실행(Actions 탭의 Run workflow)으로만 돈다. push와 PR로는 자동 실행하지 않는다.
+# 자동 실행을 켜려면 아래에 `push: {branches: [main]}`과
+# `pull_request:`를 더한다. 수동 실행은 바뀐 파일 목록을 모르므로 모든 잡이 돌고,
+# 이미지는 빌드만 하고 레지스트리에 올리지 않는다(올리기는 push 실행에서만 한다).
+on:
+  workflow_dispatch:
+
+# 같은 브랜치에서 새로 실행하면 돌고 있던 PR 실행을 취소한다. 새 실행이 오면 앞의 실행은 의미가 없고,
+# Actions 실행 시간이 과금되는 저장소에서는 그 실행 시간도 줄어든다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # 무엇이 바뀌었는지 정한다. 아래 잡들이 이 값을 보고 자기가 돌지 말지 정한다.
+  #
+  # 변경 판정은 `lint` 안에 둔다. GitHub은 잡 하나를 최소 1분으로 과금하므로(10초를 돌아도 1분)
+  # 판정만 하는 잡을 따로 두면 1분이 더 든다. `lint`는 어차피 매번 돌고 체크아웃도 하므로 여기 얹는다.
+  #
+  # `api-gateway`·`images`는 lint를 기다린다. lint가 깨진 실행에 pytest를 따로 돌리지 않는다.
+  # 워크플로 수준 `paths:` 대신 잡 수준 `if:`로 거른다. `paths:`로 거르면 워크플로가
+  # 아예 뜨지 않아 체크가 보고되지 않고, 필수 체크를 걸면 그 PR은 머지할 수 없게 된다.
+  # 건너뛴 잡은 `skipped`로 보고된다.
+  lint:
+    runs-on: ubuntu-latest
+    # 아래 필터가 API로 PR 파일 목록을 받는다. 저장소 기본 토큰 권한이 `contents: read`
+    # 뿐이라 그대로는 403이다. 이 잡에만 읽기 권한 하나를 더 준다.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      backend: ${{ steps.f.outputs.backend }}
+      images: ${{ steps.f.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 바뀐 파일 목록을 API로 받는다. `git diff`를 쓰면 `fetch-depth: 0`(전체 히스토리)이
+      # 필요하고, 그 클론 시간이 이 잡을 1분 과금 경계 너머로 밀어 올린다.
+      # 얕은 체크아웃 그대로 두고 목록만 요청한다.
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          R=${{ github.repository }}
+          if [ -n "${PR:-}" ]; then
+            files=$(gh api --paginate "/repos/$R/pulls/$PR/files" -q '.[].filename')
+          elif [ -n "${BEFORE_SHA:-}" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            files=$(gh api "/repos/$R/compare/$BEFORE_SHA...${{ github.sha }}" -q '.files[].filename')
+          else
+            files="(unknown)"
+          fi
+          # 빈 목록도 목록을 받지 못한 것으로 처리한다. `gh`가 실패하면 `set -e`가 멈추지만, 성공하고
+          # 빈 배열을 돌려주면 아무 잡도 걸리지 않아 모두 skip되고 실행이 성공으로 끝난다.
+          # 필터가 조용히 틀린 채 검증이 돌지 않는 것을 막으려고 fail-closed로 둔다.
+          if [ -z "${files//[[:space:]]/}" ]; then files="(unknown)"; fi
+          echo "바뀐 파일:"; echo "$files" | sed 's/^/  /'
+          # 목록을 받지 못했으면 모두 돈다. 바뀐 파일을 모른 채 잡을 건너뛰면 검증이 조용히 빠진다.
+          hit() { [ "$files" = "(unknown)" ] && return 0; echo "$files" | grep -qE "$1"; }
+          # 파이썬 워크스페이스 멤버 넷(api-gateway·worker-io·worker-jobs·reborn-transcode)과 계약을 본다.
+          # 멤버를 더하면 여기도 더한다. 빠진 멤버만 고친 PR은 서버 테스트를 건너뛴다.
+          if hit '^(apps/api-gateway/|workers/|packages/(reborn-contracts|reborn-transcode)/|scripts/|pyproject\.toml|uv\.lock|docs/api/openapi\.json|docs/deliverables/05_|\.github/workflows/ci\.yml)'; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=false" >> "$GITHUB_OUTPUT"
+          fi
+          # `ci.yml`은 이미지 판정 목록에 넣지 않는다. 넣으면 워크플로 주석 한 줄만 고쳐도
+          # 이미지 잡 6개가 다시 돈다(잡마다 최소 1분이 과금된다).
+          #
+          # Dockerfile은 `infra/docker/`에 있어 ci.yml과 무관하다. ci.yml 변경 중 이미지 빌드를
+          # 깨뜨릴 수 있는 것은 `images` 잡 정의 자체뿐이다. 그 정의는 main 푸시에서 어차피
+          # 빌드되므로(바로 아래 `push` 조건) 거기서 실패로 드러난다.
+          # 대신 그 실패는 머지 전이 아니라 머지 직후에 드러난다.
+          #
+          # `backend` 쪽(위)에는 ci.yml을 그대로 둔다. 거기엔 `api-gateway` 잡 정의와
+          # pytest·드리프트가 걸려 있어 같은 논리가 통하지 않는다.
+          if [ "${{ github.event_name }}" = "push" ] \
+             || hit '^(infra/docker/|pyproject\.toml|uv\.lock|pnpm-lock\.yaml|package\.json|apps/web/package\.json)'; then
+            echo "images=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "images=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: ruff (E/F/I/N/UP/B/SIM — pyproject.toml 설정)
+        run: uvx ruff check .
+
+      # 도메인 경계 계약. 허용 목록 밖 교차 import는 빌드 실패다.
+      # 문서에만 적은 경계는 지켜지지 않으므로 도구로 검사한다.
+      - name: import-linter (도메인 경계)
+        working-directory: apps/api-gateway
+        run: uv run --group test lint-imports
+      - name: import-linter (워크스페이스 패키지 방향 — 루트 .importlinter)
+        run: uv run --all-packages --group test lint-imports --config .importlinter
+
+      # 서버가 던지는 에러 코드가 화면 사전에 있는지 본다. 없으면 원문이 나가지는
+      # 않지만 "처리하지 못했습니다"라는 일반 문구가 되고, 유일한 신호인
+      # `console.warn`은 아무도 보지 않는다. stdlib만 쓰므로 uv 없이 돈다.
+      - name: check-error-codes (서버 코드 → 화면 사전)
+        run: python3 scripts/ci/check-error-codes.py
+
+      # 서버가 남기는 이벤트 종류가 화면 사전에 있는지 본다. 없으면 감사 로그·최근
+      # 활동에 원문이 그대로 나간다(`작업 restored_by_qa`). 자주 나지 않는 이벤트라
+      # 눈으로는 잡히지 않는다. stdlib만 쓰므로 uv 없이 돈다.
+      - name: check-event-labels (서버 이벤트 → 화면 사전)
+        run: python3 scripts/ci/check-event-labels.py
+
+      # JSONB를 파이썬에서 합쳐 되쓰면 그 사이 다른 워커가 쓴 key가 사라진다.
+      # 병합은 `merge_extra`로 하고 이 검사가 그 규칙을 지킨다.
+      - name: check-jsonb-merge (extra 통째 대입 금지)
+        run: python3 scripts/ci/check-jsonb-merge.py
+
+      # 파이썬은 첫 문장일 때만 문자열을 독스트링으로 삼는다. 다른 위치의 문자열은 값으로
+      # 버려지는데, 읽는 사람만 문서라고 믿는다. `help()`에도 IDE에도 나오지 않는다.
+      # 주의: 내용이 낡은 실제 독스트링은 잡지 못한다. 여기서 보는 것은 위치뿐이다.
+      - name: check-dead-docstrings (독스트링 자리가 아닌 문자열)
+        run: python3 scripts/ci/check-dead-docstrings.py
+
+      # 환경변수 이름이 config·사전·prod compose·두 env 예시에서 맞는지 본다. 어긋나면 운영에서
+      # 키가 컨테이너에 전달되지 않거나 필수 시크릿이 빠져 기동이 멈춘다.
+      - name: check-env-catalog (환경변수 사전과 prod 전달이 맞는가)
+        run: python3 scripts/ci/check-env-catalog.py
+
+      # 재시도 상한을 둔 모듈이 일시 오류를 구분하는지 본다. 구분하지 않으면 429·타임아웃
+      # 세 번에 영구 실패로 굳고, 그 값을 지우는 코드가 없으면 되돌릴 방법도 없다.
+      - name: check-retry-caps (일시 오류를 가리는가)
+        run: python3 scripts/ci/check-retry-caps.py
+
+      # FE 타입체크. 락파일을 커밋하므로 설치가 결정적이다.
+      # --frozen-lockfile이라 락파일과 package.json이 어긋나면 여기서 먼저 걸린다.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: pnpm install (frozen)
+        run: pnpm install --frozen-lockfile
+      - name: tsc --noEmit (web)
+        run: pnpm --filter @reborn/web exec tsc --noEmit
+
+      # 화면 순수 로직 단위 테스트. 표기·집계·조사·오류 문구를 본다(`apps/web/src/lib/*.test.ts`).
+      # 틀려도 tsc가 잡지 못하고 화면만 조용히 틀리는 곳이라 여기서 막는다
+      # (예: 날짜가 하루 밀려 차트가 통째로 0이 된다).
+      # 주의: verify.sh의 자기 점검은 `scripts/**/*.{py,mjs}`만 세어 이 스텝이 빠져도 모른다.
+      #   두 곳을 같이 고친다.
+      - name: vitest (web 순수 로직)
+        run: pnpm --filter @reborn/web test
+
+      # 절 제목이 heading으로 나가는지 본다. 태그가 span이어도 잘 컴파일되므로
+      # tsc도 vite build도 잡지 않는다. 빌드가 필요 없는 소스 검사라 여기 둔다
+      # (check-utilities는 dist가 있어야 해서 PR 전에 수동으로 돌린다).
+      #
+      # `--strict`로 새 화면을 막는다. 새로 생기는 것은 그때 막는 편이 나중에 훑는 것보다 싸다.
+      # 제목이 아닌 곳은 `EXPECTED`에 사유와 함께 등재한다.
+      - name: check-headings (web)
+        run: node apps/web/scripts/check-headings.mjs --strict
+
+      # 조회 실패를 "없습니다"로 그리는 곳을 찾는다. 새 화면은 막는다.
+      # 빈 상태가 권한·역할의 결과인 곳은 기계가 가르지 못하므로 `EXPECTED`에 사유와 함께 등재한다.
+      # 새로 생긴 곳은 저자가 그때 정하는 편이 나중에 훑어 찾는 것보다 싸다.
+      - name: check-query-states (web)
+        run: node apps/web/scripts/check-query-states.mjs --strict
+
+      # 비가역 액션의 확인창에 무슨 일이 일어나는지 적혀 있는지 본다. 문구가 없는 것은
+      # 문법 오류가 아니라서 tsc도 check-copy도 잡지 않는다.
+      # 주의: 문장이 있는지만 본다. 그 말이 맞는지는 보지 않는다. 서버가 실제로 무엇을 하는지는
+      #   사람이 코드를 열어 봐야 안다(예: `프로젝트 삭제`는 soft delete다).
+      - name: check-danger-copy (web)
+        run: node apps/web/scripts/check-danger-copy.mjs --strict
+
+      # 입력란에 이름이 있는지 본다. `placeholder`는 이름이 아니다. 입력하기 시작하면
+      # 사라지고 보조기술이 이름으로 읽어 줄지도 정해져 있지 않다.
+      # 주의: 이름이 있는지만 본다. `aria-label="입력"` 같은 것도 통과한다.
+      - name: check-a11y-names (web)
+        run: node apps/web/scripts/check-a11y-names.mjs --strict
+
+      # 두 규칙을 본다. 행 인자를 받지 않는 표 열과, body에서 상속되는
+      # 줄바꿈 유틸의 재선언이다. 둘 다 tsc도 vite build도 잡지 않고 화면은 멀쩡해 보인다.
+      - name: check-false-signals (web)
+        run: node apps/web/scripts/check-false-signals.mjs
+
+      # 기준 부품이 있는데 화면이 손으로 베낀 곳을 찾는다.
+      # 한 글자가 빠지면 같은 카드의 그림자가 화면마다 달라진다. 함께 보는 둘은
+      # 자리표시로 쓴 수가 화면에 나오는 경우다. `Math.min(a || Infinity, …)`는
+      # `마지막 업데이트 Invalid Date`를 찍고, `?? Number.MAX_SAFE_INTEGER`는 표본 없는 사람을
+      # 가장 느린 사람으로 정렬한다. 셋 다 tsc도 vite build도 잡지 않는다.
+      # 주의: 평평한 것이 맞는 곳은 `FLAT_OK`에 사유와 함께 등재한다.
+      - name: check-surface (web)
+        run: node apps/web/scripts/check-surface.mjs
+
+      # 독스트링이 다른 함수 위에 남아 있는지 본다. 코드가 옮겨 가면 설명만 제자리에 남아,
+      # 원래 함수는 설명이 없어 보이고 엉뚱한 함수 위에 다른 함수의 설명이 붙는다.
+      # 주의: 한 개짜리 낡은 독스트링은 잡지 못한다. 옮겨 가고 남은 것만 본다.
+      - name: check-orphan-docstrings (web)
+        run: node apps/web/scripts/check-orphan-docstrings.mjs
+
+      # 화면 문구 관례를 본다. 1인칭·`벤더` 금지, `~합니다` 종결, `해주세요`·`…` 통일,
+      # 서버 문자열의 마크다운, 내부 값 노출, `내용 — 내용` 대시 잇기다.
+      - name: check-copy (화면 문구 관례)
+        run: cd apps/web && node scripts/check-copy.mjs
+
+      # 화면이 부르는데 서버에 없는 경로를 찾는다. 반대 방향(`check-orphan-routes`)은
+      # 붙일지 제거할지를 사람이 정해야 해서 CI에 넣지 않지만, 이쪽은 반드시 404가 나므로
+      # 판단이 필요 없다. 오타든 지운 라우트든 고친다. 화면은 "데이터 없음"처럼 조용히
+      # 오작동하므로 실행 전에 잡는 가치가 크다.
+      - name: check-missing-routes (화면이 부르는데 서버에 없는 경로)
+        run: node scripts/ci/check-missing-routes.mjs
+      - name: check-request-bodies (서버가 요구하는 본문을 화면이 보내는가)
+        run: node scripts/ci/check-request-bodies.mjs
+      - name: check-jargon (화면 문구에 내부 용어가 없는가)
+        run: node apps/web/scripts/check-jargon.mjs --strict
+      # 도메인 경계(features/<도메인>/) 위반. 규칙 하나라도 1건이 되면 막는다. 옛 경로 import도 같이 센다.
+      # 위치는 --list 로 본다.
+      - name: check-feature-boundaries (도메인 경계 위반)
+        run: node apps/web/scripts/check-feature-boundaries.mjs --strict
+      # 주석 말투. 오검출이 거의 없는 네 규칙만 막는다.
+      # 주석 추출에 apps/web의 typescript를 쓰므로 pnpm install 뒤에 둔다. 위치는 --list 로 본다.
+      - name: check-comment-style (주석의 지시어·강조 기호·대시 잇기·1인칭)
+        run: python3 scripts/ci/check-comment-style.py --strict --rule 지시어 --rule 강조기호 --rule 대시잇기 --rule 1인칭
+
+      # NOTE: mypy(strict)는 아직 넣지 않는다. 기존 위반 규모를 확인한 뒤 단계적으로 넣는다.
+
+  # 이미지 파이프라인.
+  # PR에서는 빌드만 하고(Dockerfile 회귀 게이트), main push에서는 NCP Container Registry로 push한다.
+  #
+  # 레지스트리는 NCR을 쓴다. 배포 대상이 NCP 서버 한 대라 pull이 내부 트래픽이고,
+  # 이미 있는 NCP 서브계정 키 하나로 인증이 끝난다. GHCR을 쓰면 서버에 만료되는
+  # GitHub PAT를 하나 더 심어야 한다.
+  #
+  # 태그는 `{name}:sha-<12>`가 배포 참조 단위이고 latest는 만들지 않는다.
+  # 롤백은 이전 sha로 다시 배포한다. latest 태그로는 어느 커밋의 이미지인지 알 수 없다.
+  images:
+    needs: lint
+    if: needs.lint.outputs.images == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - name: api
+            dockerfile: infra/docker/api.Dockerfile
+          - name: worker-io
+            dockerfile: infra/docker/worker-io.Dockerfile
+          - name: worker-jobs
+            dockerfile: infra/docker/worker-jobs.Dockerfile
+          # GPU 서버용 잡 워커(CUDA 런타임·ONNX Runtime GPU). 러너에 GPU가 없어도 빌드는 된다.
+          - name: worker-gpu
+            dockerfile: infra/docker/worker-gpu.Dockerfile
+          - name: web
+            dockerfile: infra/docker/web.Dockerfile
+          - name: pgbackup
+            dockerfile: infra/docker/pgbackup.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: NCR 로그인 (main push에만)
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.IMAGE_REGISTRY }}
+          username: ${{ secrets.NCP_ACCESS_KEY }}
+          password: ${{ secrets.NCP_SECRET_KEY }}
+      - name: 빌드 (+ main이면 push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # 배포 대상이 x86_64라 러너와 같은 아키텍처여서 크로스 빌드가 필요 없다.
+          # 서버가 ARM으로 바뀌면 platforms를 명시해야 한다(그러지 않으면 조용히 뜨지 않는다).
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ vars.IMAGE_REGISTRY }}/rebornstudio-${{ matrix.name }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+  api-gateway:
+    needs: lint
+    if: needs.lint.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: rebornstudio
+          POSTGRES_USER: reborn
+          POSTGRES_PASSWORD: reborn
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U reborn -d rebornstudio"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://reborn:reborn@localhost:5433/rebornstudio
+      REDIS_URL: redis://localhost:6379/0
+      # config의 ENVIRONMENT 기본값은 prod다. 마이그레이션·시드·OpenAPI 생성이 개발용 비밀값으로 돌도록
+      # 잡 전체를 test로 둔다. 목록에 없는 이름(ci 등)이면 Settings() 생성이 비밀값 검사에서 멈춘다.
+      ENVIRONMENT: test
+      # 저장소 env는 없다. 테스트 스토리지는 conftest가 인프로세스 moto로 띄우고 그 주소를 가리키는
+      # 자격증명 연결을 DB에 등록한다(tests/_storage.py).
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install workspace deps
+        # --all-packages: worker-io 등 워크스페이스 멤버까지 설치한다. api-gateway 테스트가
+        # worker_io.celery_app을 import하므로 단일 패키지 sync면 ModuleNotFoundError가 난다.
+        run: uv sync --all-packages --group test
+
+      - name: Alembic migrate
+        working-directory: apps/api-gateway
+        run: uv run --package api-gateway alembic upgrade head
+
+      # super_admin은 마이그레이션이 아니라 스크립트가 심는다. 그 편의가
+      # 마이그레이션에 있으면 운영에도 실린다.
+      # conftest도 스스로 시드하므로 이 스텝은 안전망이다.
+      - name: Seed super_admin (idempotent)
+        working-directory: apps/api-gateway
+        run: uv run --package api-gateway python ../../scripts/dev/seed_admin.py
+
+      # DB가 필요 없고 몇 초면 끝나므로 긴 pytest 앞에 둔다. 실패하면 뒤의 스텝을 실행하지 않는다.
+      # 새 잡으로 떼지 않는다. 잡 하나가 최소 1분으로 과금된다.
+      # ffmpeg가 필요한 테스트는 러너에 ffmpeg가 없어 건너뛴다.
+      - name: pytest (reborn-transcode)
+        working-directory: packages/reborn-transcode
+        run: uv run --package reborn-transcode --group test pytest tests/ -q
+
+      # 무DB 잡 워커다. DB도 브로커도 쓰지 않아 긴 pytest 앞에 둔다(위와 같은 이유로 잡을 떼지 않는다).
+      - name: pytest (worker-jobs)
+        working-directory: workers/worker-jobs
+        run: uv run --package worker-jobs --group test pytest tests/ -q
+
+      # 병렬로 돈다. 이 잡이 CI 과금의 대부분이고 그 안에서 pytest가 가장 오래 걸린다.
+      # 워커별로 DB와 Redis 인덱스를 가르면(`tests/_xdist_split.py`) 안전하게 나눌 수 있다.
+      # 이 저장소의 격리는 트랜잭션이 아니라 unique email/slug라, 같은 DB를 나눠 쓰면
+      # 정리 DELETE가 다른 워커의 행을 지운다.
+      #
+      # `-n 4`는 러너의 vCPU 수다(GitHub `ubuntu-latest`는 4개). `auto`로 두면 러너가 커질 때
+      # 워커 수가 Redis 인덱스 수(16개) 한계에 먼저 닿는다. 수를 고정해 그 한계에 갑자기 닿지 않게 한다.
+      #
+      # `-v`는 쓰지 않는다. 테스트마다 한 줄이 로그를 채워 실패한 줄을 찾기 어렵고, 병렬이면
+      # 순서도 섞인다. 실패는 `-q`도 트레이스백을 그대로 낸다.
+      #
+      # `-n 4`로 돌리면 단독 실행보다 약 3배 빠르다.
+      - name: pytest (-n 4)
+        working-directory: apps/api-gateway
+        run: uv run --package api-gateway --group test pytest tests/ -q -n 4
+
+      # 잡의 기본 DB와 Redis 0번에 붙는다. api-gateway pytest 뒤에 둔다.
+      # 앞에 두면 이 테스트가 남긴 행이 xdist 워커 DB의 템플릿에 섞인다(tests/_xdist_split.py).
+      - name: pytest (worker-io)
+        working-directory: workers/worker-io
+        run: uv run --package worker-io --group test pytest tests/ -q
+
+      - name: OpenAPI 갱신 검증 (drift 검출)
+        run: |
+          uv run --package api-gateway python scripts/dev/gen_openapi.py
+          git diff --exit-code docs/api/openapi.json \
+            || (echo "::error::openapi.json이 최신이 아닙니다 — 'make openapi' 후 커밋"; exit 1)
+
+      - name: TypeScript contracts drift 검증
+        run: |
+          npx -y openapi-typescript docs/api/openapi.json \
+            -o packages/reborn-contracts/typescript/src/api.ts
+          git diff --exit-code packages/reborn-contracts/typescript/src/api.ts \
+            || (echo "::error::TS contracts가 최신이 아닙니다 — 'make contracts' 후 커밋"; exit 1)

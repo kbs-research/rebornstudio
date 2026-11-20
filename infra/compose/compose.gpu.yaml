@@ -1,0 +1,24 @@
+# GPU 서버 덮어쓰기. 운영 형상(compose.yaml + compose.prod.yaml) 위에 얹는다.
+#
+# worker-gpu만 바꾼다. GPU 이미지(rebornstudio-worker-gpu)를 쓰고 GPU 한 장을 예약한다.
+# 비식별화는 ONNX Runtime CUDA로 추론하고, 변환과 비식별화 결과 영상은 NVENC로 인코딩한다.
+#
+# 이 파일을 공통 형상에 넣지 않는 이유: GPU 장치 예약은 NVIDIA Container Toolkit이 없는 서버에서
+# 컨테이너 생성 자체를 실패시킨다. GPU가 없는 서버도 같은 형상으로 돌아야 하므로(그때는 CPU 추론과
+# libx264로 돈다) GPU 설정은 따로 두고, `.env`의 `GPU_ENABLED=true`일 때만 배포 스크립트가 얹는다
+# (infra/deploy/profiles.sh의 `compose_files`).
+#
+# 확인: docker compose -f infra/compose/compose.yaml -f infra/compose/compose.prod.yaml \
+#         -f infra/compose/compose.gpu.yaml config   (VAR 채운 뒤)
+
+services:
+  worker-gpu:
+    image: ${IMAGE_REGISTRY:?}/rebornstudio-worker-gpu:${IMAGE_TAG:?CI가 만든 sha 태그 필요}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # 한 장만 쓴다. 실행 수(GPU_WORKER_CONCURRENCY)가 그 한 장의 메모리를 나눠 쓴다.
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

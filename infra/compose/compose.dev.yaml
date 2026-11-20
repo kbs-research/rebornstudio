@@ -1,0 +1,188 @@
+# RebornStudio 개발 덮어쓰기. compose.yaml과 같이 쓴다(보통 make dev-up).
+#
+# 형상은 운영과 같다(워커 셋: beat를 품은 짧은 작업 워커, 품질검수 워커, DB 없는 긴 작업 워커).
+# 개발에서만 다른 것은 넷이다.
+#   이미지를 저장소에서 빌드한다 · 호스트 루프백에 포트를 연다 · 저장소 루트 .env를 읽는다 ·
+#   소스를 마운트해 api와 web이 재빌드 없이 코드 변경을 반영한다.
+
+# 프로젝트 이름을 고정한다. 볼륨 이름(essential_pg-data 등)이 이 이름에서 나오므로 파일 위치가
+# 바뀌어도 기존 개발 DB를 그대로 쓴다. 다른 이름으로 띄우려면 `-p`로 덮는다.
+# 같은 기계의 다른 compose 스택과 이름이 겹치면 서로의 컨테이너를 덮으므로 고유한 이름을 쓴다.
+name: essential
+
+# 저장소 루트 .env를 읽고, docker 내부 호스트(postgres/redis)만 environment로 덮어쓴다.
+# 루트 .env보다 dev-defaults.env를 먼저 읽는다. 루트 .env가 ENVIRONMENT를 빠뜨려도 local로 뜬다
+# (config 기본값은 prod다). 루트 .env에 값이 있으면 그 값이 우선한다.
+# NCP 저장소·MI 자격증명은 .env에 없다. 로컬 DB의 자격증명 연결에 등록하고 프로젝트가 고른다.
+# PYTHONDONTWRITEBYTECODE는 마운트한 소스 폴더에 컨테이너용 .pyc가 쌓이지 않게 한다.
+x-dev-env: &dev-env
+  DATABASE_URL: postgresql+asyncpg://reborn:reborn@postgres:5432/rebornstudio
+  REDIS_URL: redis://redis:6379/0
+  PYTHONDONTWRITEBYTECODE: "1"
+
+# api-gateway와 worker-io 소스 마운트. 이미지 안의 워크스페이스 패키지는 uv editable 설치라
+# 마운트한 소스를 그대로 import한다. api는 --reload로 바로, 워커는 재시작하면 반영된다.
+# 공용 패키지(reborn-contracts·reborn-transcode)도 마운트한다. 빠지면 계약을 바꾼 변경이 들어와도
+# api와 워커가 이미지를 만들 때의 옛 계약으로 돌아, 새 필드를 모르는 응답 모델이 500을 낸다.
+# 의존성(pyproject·uv.lock)을 바꿨으면 여전히 재빌드가 필요하다.
+x-dev-src: &dev-src
+  - ../../apps/api-gateway:/app/apps/api-gateway
+  - ../../workers/worker-io:/app/workers/worker-io
+  - ../../packages/reborn-contracts/python:/app/packages/reborn-contracts/python
+  - ../../packages/reborn-transcode:/app/packages/reborn-transcode
+
+# 워커 공통. worker-io 이미지를 빌드한다. ffmpeg가 필요해 api와 별도 이미지를 쓴다.
+x-dev-worker: &dev-worker
+  build:
+    context: ../..
+    dockerfile: infra/docker/worker-io.Dockerfile
+  env_file:
+    - dev-defaults.env
+    - ../../.env
+  environment: *dev-env
+  volumes: *dev-src
+
+# 무DB 잡 워커. worker-jobs 이미지를 빌드한다. api-gateway·worker-io 소스가 이미지에 없으므로
+# 자기 소스와 공용 패키지만 마운트한다. 재시작하면 반영된다.
+x-dev-jobs: &dev-jobs
+  build:
+    context: ../..
+    dockerfile: infra/docker/worker-jobs.Dockerfile
+  env_file:
+    - dev-defaults.env
+    - ../../.env
+  environment: *dev-env
+  volumes:
+    - ../../workers/worker-jobs:/app/workers/worker-jobs
+    - ../../packages/reborn-contracts/python:/app/packages/reborn-contracts/python
+    - ../../packages/reborn-transcode:/app/packages/reborn-transcode
+    - ../../packages/deident:/app/packages/deident
+
+# 호스트 포트는 모두 127.0.0.1에만 묶는다. 주소 없이 쓰면 0.0.0.0에 열려 같은 망의 다른 PC가
+# 개발 DB(비밀번호 reborn)·Redis·API·지표에 바로 붙는다. 다른 기기에서 화면을 봐야 하면 SSH 터널을 쓴다.
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: reborn
+    ports: ["127.0.0.1:${DEV_PG_PORT:-5433}:5432"]   # 호스트에 native postgres가 있을 수 있어 5432를 피한다
+    healthcheck:
+      interval: 5s
+      retries: 5
+
+  redis:
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports: ["127.0.0.1:${DEV_REDIS_PORT:-6380}:6379"]   # 호스트 6379와 겹치지 않게 한다
+    healthcheck:
+      interval: 5s
+      retries: 5
+
+  # 오브젝트 스토리지는 모든 환경에서 NCP 하나라 로컬 스토리지 서비스를 두지 않는다.
+  # 버킷·키는 자격증명 연결(로컬 DB)이 갖고 프로젝트가 고른다.
+
+  # api. 이미지 CMD에 --reload만 더한다. 소스는 마운트한 것을 쓴다.
+  # 공용 패키지도 감시해 계약만 바꾼 변경에도 다시 뜬다.
+  # 도커 볼륨은 파일 이벤트가 안 오는 경우가 있어 web의 VITE_DOCKER처럼 폴링 감시를 켠다.
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    command: ["uv", "run", "--package", "api-gateway", "uvicorn",
+              "api_gateway.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers",
+              "--reload", "--reload-dir", "/app/apps/api-gateway/api_gateway",
+              "--reload-dir", "/app/packages/reborn-contracts/python/src",
+              "--reload-dir", "/app/packages/reborn-transcode/src"]
+    env_file:
+      - dev-defaults.env
+      - ../../.env
+    environment:
+      <<: *dev-env
+      # compose 네트워크(도커 브리지 대역)의 프록시만 믿는다. 운영은 web·api만 붙는 edge 서브넷
+      # 하나로 좁힌다(compose.prod.yaml). 개발은 포트가 루프백에만 열리고 앞단이 vite 하나라 넓게 둔다.
+      FORWARDED_ALLOW_IPS: "172.16.0.0/12"
+      WATCHFILES_FORCE_POLLING: "true"
+    ports: ["127.0.0.1:${DEV_API_PORT:-8000}:8000"]
+    volumes: *dev-src
+    # 컨테이너를 새로 만들면 uv가 마운트한 워크스페이스 패키지를 다시 설치하고, 바이트코드 캐시 없이
+    # 마운트한 소스를 읽으므로 첫 응답까지 1~2분이 걸린다. CPU를 쓰는 잡이 같이 돌면 더 걸린다.
+    # 기동 유예가 없으면 기동 중 검사 다섯 번이 실패해 unhealthy가 되고, web의 depends_on이 실패해
+    # 첫 make dev-up이 오류로 끝난다. 유예 안의 실패는 세지 않고, 성공하면 바로 healthy가 된다.
+    healthcheck:
+      interval: 10s
+      retries: 5
+      start_period: 300s
+
+  # web: vite dev 서버(HMR 유지). 프로덕션은 nginx 정적 이미지(infra/docker/web.Dockerfile)를
+  # 쓰지만, 로컬에서까지 빌드 이미지를 쓰면 코드 한 줄 고칠 때마다 재빌드해야 한다. 그래서 여기서는
+  # 소스를 마운트한 dev 서버를 띄우고, /api 프록시만 컨테이너 이름(api:8000)으로 돌린다.
+  # node_modules는 익명 볼륨으로 컨테이너 것을 유지한다. 호스트 것(darwin 바이너리)이
+  # 덮으면 리눅스 컨테이너에서 esbuild/rollup 네이티브 모듈이 깨진다.
+  web:
+    image: node:22-slim
+    working_dir: /app
+    command: >
+      sh -c "corepack enable &&
+             pnpm install &&
+             pnpm --filter @reborn/web dev -- --port 3000"
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
+      VITE_DOCKER: "1"
+    ports: ["127.0.0.1:${DEV_WEB_PORT:-3000}:3000"]
+    volumes:
+      - ../..:/app
+      - web-root-modules:/app/node_modules
+      - web-app-modules:/app/apps/web/node_modules
+      - web-contracts-modules:/app/packages/reborn-contracts/typescript/node_modules
+    depends_on:
+      api: { condition: service_healthy }
+
+  # 마이그레이션 one-shot. host alembic 대신 컨테이너로도 돌릴 수 있다:
+  #   make dev-migrate
+  # 이 서비스는 개발 DB만 올린다. 테스트 DB는 호스트의 alembic으로 따로 올린다.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    env_file:
+      - dev-defaults.env
+      - ../../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://reborn:reborn@postgres:5432/rebornstudio
+
+  worker:
+    <<: *dev-worker
+
+  worker-qc:
+    <<: *dev-worker
+
+  # 긴 작업 워커. 늘 뜬다(compose.yaml). 개발 PC에는 GPU가 없으므로 비식별화는 CPU 추론으로,
+  # 인코딩은 libx264로 돈다. DEIDENT_MODEL을 비워 두면 기본 모델(essential-yunet)을 쓴다.
+  worker-gpu:
+    <<: *dev-jobs
+    environment:
+      <<: *dev-env
+      # 운영과 같은 스레드 수로 돌려야 로컬에서 잰 처리 시간을 운영과 비교할 수 있다.
+      TRANSCODE_THREADS: ${TRANSCODE_THREADS:-2}
+      DEIDENT_MODEL: ${DEIDENT_MODEL:-}
+      # 운영과 같은 스레드 규칙이다(compose.prod.yaml).
+      DEIDENT_THREADS: ${DEIDENT_THREADS:-}
+      GPU_WORKER_CONCURRENCY: ${GPU_WORKER_CONCURRENCY:-2}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+
+  # 백업. 운영과 달리 개발에서는 .env에 BACKUP_BUCKET을 채울 때만 뜬다(`backup` 프로필, profiles.sh).
+  # 이미지를 저장소에서 빌드하고 BACKUP_BUCKET은 .env에서 그대로 받는다. 주소는 backup.sh의 NCP
+  # 공용 주소다. aws-cli는 AWS_ACCESS_KEY_ID·AWS_SECRET_ACCESS_KEY만 읽으므로 개발 백업을 돌려 보려면
+  # 그 둘도 .env에 넣는다.
+  pg-backup:
+    profiles: ["backup"]
+    build:
+      context: ../..
+      dockerfile: infra/docker/pgbackup.Dockerfile
+    env_file:
+      - ../../.env
+    environment:
+      PGPASSWORD: reborn
+
+volumes:
+  web-root-modules:
+  web-app-modules:
+  web-contracts-modules:

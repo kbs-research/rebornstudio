@@ -1,0 +1,16 @@
+# 빌드 컨텍스트 제외. 호스트 산출물이 이미지 설치본을 덮지 않게 한다.
+# `COPY apps/web/`이 호스트 node_modules(호스트 경로 심링크)를 이미지에 덮어쓰면
+# 컨테이너 안에서 모듈 해석이 전부 깨진다. api/worker 빌드 컨텍스트 용량도 줄어든다.
+node_modules
+**/node_modules
+**/dist
+**/__pycache__
+**/.pytest_cache
+.venv
+**/.venv
+.git
+.env
+*.tsbuildinfo
+celerybeat-schedule*
+data/
+docs/patches/

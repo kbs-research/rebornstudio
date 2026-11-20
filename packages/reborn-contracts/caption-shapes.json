@@ -1,0 +1,271 @@
+{
+  "$comment": "캡션 payload를 읽는 판정 표다. 서버와 화면이 같은 문장 목록과 같은 최종 문자열을 내는지 양쪽 테스트가 이 파일을 읽어 확인한다. 값을 손으로 고치지 말고 두 구현을 고친 뒤 다시 재서 넣는다. 자세한 것은 README의 '캡션 읽기 규칙' 절.",
+  "rule": "문장 배열(caption.brief_sentences)에 개체가 하나라도 있으면 그 배열이 기준이다. 없으면 문자열(caption.brief, 더 옛날엔 caption 자체)을 문장으로 나누고 id를 위치로 붙인다(s0, s1, …). 최종 문자열은 배열이면 살아 있는 문장을 공백 하나로 잇고, 문자열이면 양끝 공백만 걷는다.",
+  "implementations": {
+    "server": "apps/api-gateway/api_gateway/services/caption.py (sentences_of · final_text)",
+    "web": "apps/web/src/features/workbench/lib/caption.ts (sentencesOf · finalText)"
+  },
+  "cases": [
+    {
+      "why": "지금 화면이 보내는 모양이다. 배열을 그대로 읽는다",
+      "payload": {
+        "caption": {
+          "brief": "앵커가 소식을 전한다. 기자가 현장을 보여 준다.",
+          "brief_sentences": [
+            {"id": "a1", "text": "앵커가 소식을 전한다."},
+            {"id": "a2", "text": "기자가 현장을 보여 준다.", "start": 60.5, "end": 64.0}
+          ]
+        }
+      },
+      "sentences": [
+        {"id": "a1", "text": "앵커가 소식을 전한다."},
+        {"id": "a2", "text": "기자가 현장을 보여 준다.", "start": 60.5, "end": 64.0}
+      ],
+      "text": "앵커가 소식을 전한다. 기자가 현장을 보여 준다."
+    },
+    {
+      "why": "문장 배열만 있고 brief가 없는 제출이다. 캡션 없음으로 읽으면 안 된다",
+      "payload": {
+        "caption": {
+          "brief_sentences": [
+            {"id": "b1", "text": "화면 하단에 자막이 보인다."},
+            {"id": "b2", "text": "지운 문장입니다.", "deleted": true}
+          ]
+        }
+      },
+      "sentences": [
+        {"id": "b1", "text": "화면 하단에 자막이 보인다."},
+        {"id": "b2", "text": "지운 문장입니다.", "deleted": true}
+      ],
+      "text": "화면 하단에 자막이 보인다."
+    },
+    {
+      "why": "옛 모양이다. brief 문자열만 있으면 문장으로 나누고 위치로 id를 붙인다",
+      "payload": {
+        "caption": {"brief": "앵커가 소식을 전한다. 기자가 현장을 연결한다."}
+      },
+      "sentences": [
+        {"id": "s0", "text": "앵커가 소식을 전한다."},
+        {"id": "s1", "text": "기자가 현장을 연결한다."}
+      ],
+      "text": "앵커가 소식을 전한다. 기자가 현장을 연결한다."
+    },
+    {
+      "why": "배열이 빈 옛 모양이다. brief로 떨어진다",
+      "payload": {
+        "caption": {"brief": "옛 payload는 문자열만 있다.", "brief_sentences": []}
+      },
+      "sentences": [
+        {"id": "s0", "text": "옛 payload는 문자열만 있다."}
+      ],
+      "text": "옛 payload는 문자열만 있다."
+    },
+    {
+      "why": "옛 모양이다. caption 자체가 문자열이다",
+      "payload": {
+        "caption": "caption이 문자열이던 시절이다. 두 문장이다!"
+      },
+      "sentences": [
+        {"id": "s0", "text": "caption이 문자열이던 시절이다."},
+        {"id": "s1", "text": "두 문장이다!"}
+      ],
+      "text": "caption이 문자열이던 시절이다. 두 문장이다!"
+    },
+    {
+      "why": "문자열의 줄바꿈은 문장 경계로 읽고, 최종 문자열에는 그대로 둔다",
+      "payload": {
+        "caption": {"brief": "  첫 문장입니다.\n둘째 문장입니다?  "}
+      },
+      "sentences": [
+        {"id": "s0", "text": "첫 문장입니다."},
+        {"id": "s1", "text": "둘째 문장입니다?"}
+      ],
+      "text": "첫 문장입니다.\n둘째 문장입니다?"
+    },
+    {
+      "why": "종결 부호가 없으면 통째로 한 문장이다",
+      "payload": {
+        "caption": {"brief": "마침표가 없는 캡션"}
+      },
+      "sentences": [
+        {"id": "s0", "text": "마침표가 없는 캡션"}
+      ],
+      "text": "마침표가 없는 캡션"
+    },
+    {
+      "why": "모든 문장을 지운 배열은 빈 캡션이다. 남은 brief는 파생값이라 보지 않는다",
+      "payload": {
+        "caption": {
+          "brief": "지운 문장입니다.",
+          "brief_sentences": [{"id": "c1", "text": "지운 문장입니다.", "deleted": true}]
+        }
+      },
+      "sentences": [
+        {"id": "c1", "text": "지운 문장입니다.", "deleted": true}
+      ],
+      "text": ""
+    },
+    {
+      "why": "배열의 낯선 원소는 건너뛰고 개체만 읽는다",
+      "payload": {
+        "caption": {
+          "brief": "무시되는 파생값",
+          "brief_sentences": ["문자열 원소", null, 3, {"id": "d1", "text": "개체 원소입니다."}]
+        }
+      },
+      "sentences": [
+        {"id": "d1", "text": "개체 원소입니다."}
+      ],
+      "text": "개체 원소입니다."
+    },
+    {
+      "why": "개체가 하나도 없는 배열은 없는 것과 같다. brief로 떨어진다",
+      "payload": {
+        "caption": {"brief": "문자열로 떨어진다.", "brief_sentences": ["문자열 원소", 7]}
+      },
+      "sentences": [
+        {"id": "s0", "text": "문자열로 떨어진다."}
+      ],
+      "text": "문자열로 떨어진다."
+    },
+    {
+      "why": "text가 문자열이 아닌 문장은 살아 있지 않다",
+      "payload": {
+        "caption": {
+          "brief_sentences": [
+            {"id": "e1", "text": null},
+            {"id": "e2", "text": "  살아 있는 문장입니다.  "}
+          ]
+        }
+      },
+      "sentences": [
+        {"id": "e1", "text": null},
+        {"id": "e2", "text": "  살아 있는 문장입니다.  "}
+      ],
+      "text": "살아 있는 문장입니다."
+    },
+    {
+      "why": "캡션 필드가 아예 없는 payload다",
+      "payload": {},
+      "sentences": [],
+      "text": ""
+    },
+    {
+      "why": "낯선 모양 하나가 읽기를 깨뜨리지 않는다",
+      "payload": {"caption": null},
+      "sentences": [],
+      "text": ""
+    },
+    {
+      "why": "공백뿐인 문자열 캡션은 문장이 없다",
+      "payload": {"caption": "   "},
+      "sentences": [],
+      "text": ""
+    },
+    {
+      "why": "말줄임표(점 셋) 뒤에서는 끊지 않는다",
+      "payload": {"caption": {"brief": "소토 3타점... 기선 제압."}},
+      "sentences": [
+        {"id": "s0", "text": "소토 3타점... 기선 제압."}
+      ],
+      "text": "소토 3타점... 기선 제압."
+    },
+    {
+      "why": "말줄임표 문자(…) 뒤에서도 끊지 않는다",
+      "payload": {"caption": {"brief": "끝났다… 다음은"}},
+      "sentences": [
+        {"id": "s0", "text": "끝났다… 다음은"}
+      ],
+      "text": "끝났다… 다음은"
+    },
+    {
+      "why": "말줄임표 문자(⋯) 뒤에서도 끊지 않는다",
+      "payload": {"caption": {"brief": "잠시만⋯ 기다려 주십시오."}},
+      "sentences": [
+        {"id": "s0", "text": "잠시만⋯ 기다려 주십시오."}
+      ],
+      "text": "잠시만⋯ 기다려 주십시오."
+    },
+    {
+      "why": "마침표 하나 뒤의 공백은 문장 경계다",
+      "payload": {"caption": {"brief": "첫 문장. 둘째 문장."}},
+      "sentences": [
+        {"id": "s0", "text": "첫 문장."},
+        {"id": "s1", "text": "둘째 문장."}
+      ],
+      "text": "첫 문장. 둘째 문장."
+    },
+    {
+      "why": "물음표와 느낌표 뒤의 공백도 문장 경계다",
+      "payload": {"caption": {"brief": "정말? 그래!"}},
+      "sentences": [
+        {"id": "s0", "text": "정말?"},
+        {"id": "s1", "text": "그래!"}
+      ],
+      "text": "정말? 그래!"
+    },
+    {
+      "why": "소수점은 뒤에 공백이 없어 끊지 않는다",
+      "payload": {"caption": {"brief": "3.5% 올랐다. 다음"}},
+      "sentences": [
+        {"id": "s0", "text": "3.5% 올랐다."},
+        {"id": "s1", "text": "다음"}
+      ],
+      "text": "3.5% 올랐다. 다음"
+    },
+    {
+      "why": "곧은 큰따옴표 안의 마침표에서는 끊지 않는다. 인용 발언이 한 문장에 남는다",
+      "payload": {"caption": {"brief": "그가 \"왔다. 갔다.\"고 말했다. 다음 문장."}},
+      "sentences": [
+        {"id": "s0", "text": "그가 \"왔다. 갔다.\"고 말했다."},
+        {"id": "s1", "text": "다음 문장."}
+      ],
+      "text": "그가 \"왔다. 갔다.\"고 말했다. 다음 문장."
+    },
+    {
+      "why": "인용문 안에 문장이 여럿이어도 따옴표가 닫힐 때까지 한 문장이다",
+      "payload": {"caption": {"brief": "한 남성이 \"와 드디어 왔네요. 진짜 만나고 싶었어요. 진짜.\"라고 말하며 반가운 마음을 전합니다. 화면이 바뀝니다."}},
+      "sentences": [
+        {"id": "s0", "text": "한 남성이 \"와 드디어 왔네요. 진짜 만나고 싶었어요. 진짜.\"라고 말하며 반가운 마음을 전합니다."},
+        {"id": "s1", "text": "화면이 바뀝니다."}
+      ],
+      "text": "한 남성이 \"와 드디어 왔네요. 진짜 만나고 싶었어요. 진짜.\"라고 말하며 반가운 마음을 전합니다. 화면이 바뀝니다."
+    },
+    {
+      "why": "둥근 큰따옴표 안에서도 끊지 않는다",
+      "payload": {"caption": {"brief": "시장은 “예산을 늘린다. 곧 발표한다.”고 밝혔다. 이어서 질의가 있었다."}},
+      "sentences": [
+        {"id": "s0", "text": "시장은 “예산을 늘린다. 곧 발표한다.”고 밝혔다."},
+        {"id": "s1", "text": "이어서 질의가 있었다."}
+      ],
+      "text": "시장은 “예산을 늘린다. 곧 발표한다.”고 밝혔다. 이어서 질의가 있었다."
+    },
+    {
+      "why": "작은따옴표로 묶은 구절 안에서도 끊지 않는다",
+      "payload": {"caption": {"brief": "정부는 '경제 회복. 민생 안정.'을 내세웠다. 끝."}},
+      "sentences": [
+        {"id": "s0", "text": "정부는 '경제 회복. 민생 안정.'을 내세웠다."},
+        {"id": "s1", "text": "끝."}
+      ],
+      "text": "정부는 '경제 회복. 민생 안정.'을 내세웠다. 끝."
+    },
+    {
+      "why": "닫히지 않은 따옴표는 묶음으로 보지 않는다. 종결 부호 뒤의 공백에서 그대로 끊는다",
+      "payload": {"caption": {"brief": "그가 \"왔다. 갔다고 말했다."}},
+      "sentences": [
+        {"id": "s0", "text": "그가 \"왔다."},
+        {"id": "s1", "text": "갔다고 말했다."}
+      ],
+      "text": "그가 \"왔다. 갔다고 말했다."
+    },
+    {
+      "why": "영문 낱말 안의 아포스트로피는 따옴표가 아니다",
+      "payload": {"caption": {"brief": "It's done. That's it."}},
+      "sentences": [
+        {"id": "s0", "text": "It's done."},
+        {"id": "s1", "text": "That's it."}
+      ],
+      "text": "It's done. That's it."
+    }
+  ]
+}

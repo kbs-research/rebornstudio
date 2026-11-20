@@ -1,0 +1,151 @@
+# RebornStudio 서비스 형상. 개발과 운영이 같이 쓴다.
+#
+# 이 파일만으로는 뜨지 않는다. 이미지를 어디서 얻고 비밀을 어떻게 받는지는 환경마다
+# 달라서 덮어쓰기 파일이 정한다.
+#   개발: docker compose -f infra/compose/compose.yaml -f infra/compose/compose.dev.yaml up -d
+#   운영: docker compose -f infra/compose/compose.yaml -f infra/compose/compose.prod.yaml up -d
+# 보통은 make dev-up(개발)과 infra/deploy/deploy.sh·dc.sh(운영)가 이 조합을 대신 부른다.
+#
+# 여기에 두는 것은 두 환경에서 값이 같은 것뿐이다. 서비스 목록·워커의 소비 큐(command)·
+# 의존 순서·헬스 검사 명령·프로필이 그렇다. 워커 형상이 여기 한 곳에 있어야 개발에서 검증한
+# 큐 분리가 운영에 그대로 올라간다.
+#
+# 주의: `${VAR:?}`를 여기에 쓰지 않는다. compose는 프로필과 무관하게 파일 전체를 보간하므로
+# 운영 비밀 하나가 개발 기동을 막는다. 필수 값은 compose.prod.yaml이 요구한다.
+
+services:
+  # ── 상태 ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rebornstudio
+      POSTGRES_USER: reborn
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      # -d 필수. 없으면 사용자명과 같은 DB("reborn")에 붙으려다 5초마다 FATAL 로그를 남긴다.
+      test: ["CMD-SHELL", "pg_isready -U reborn -d rebornstudio"]
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+
+  # ── 배포 단계 one-shot ────────────────────────────────────────────────────
+  #
+  # 마이그레이션. 앱 기동과 스키마 변경을 분리한다.
+  # 마이그레이션은 언제나 구 코드와 호환이어야 한다.
+  migrate:
+    profiles: ["ops"]          # 평상시 up에 끼지 않고 run으로만 돈다
+    working_dir: /app/apps/api-gateway
+    command: ["uv", "run", "--package", "api-gateway", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # ── 진입 티어 ─────────────────────────────────────────────────────────────
+  # 개발은 vite dev 서버, 운영은 SPA 정적 + /api 스트립 프록시 nginx 이미지다.
+  # 둘이 같은 것이 없어 정의는 덮어쓰기 파일에 있다.
+  web: {}
+
+  # api 티어. 무상태이고 공유 상태는 모두 Redis에 있다.
+  api:
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # ── 워커 ──────────────────────────────────────────────────────────────────
+  # 워커는 셋이다. 서버 한 대에 맞춰 큐를 실행 시간이 비슷한 것끼리 묶는다.
+  # worker·worker-qc는 worker-io 이미지(worker_io.celery_app), worker-gpu는 worker-jobs 이미지
+  # (worker_jobs.celery_app)를 쓰고 command(소비 큐)로 구분한다. 큐 라우팅은 packages/reborn-contracts의
+  # reborn_contracts/queues.py(TASK_ROUTES)가 정한다. 여기서 큐를 빼면 그 큐의 task는 소비되지 않는다.
+
+  # 짧은 작업: q.maiu(MI 폴링·리컨실러), q.media(썸네일·probe), default(회수·내보내기·
+  # 무DB 잡의 하트비트와 완료 보고). 모두 초 단위이고 I/O 대기가 길어 한 풀에 섞어도 서로 막지 않는다.
+  # beat(주기 작업 발사)를 이 워커에 넣는다(-B). beat는 하나여야 하므로 이 서비스는 레플리카를
+  # 늘리지 않는다. 둘이 돌면 주기 작업이 두 번 실행된다.
+  # 스케줄 파일은 쓰기 가능한 /tmp에 둔다. 컨테이너를 다시 만들면 지워지지만 다음 주기부터 다시 돈다.
+  # prefetch=1과 -O fair: 실행 슬롯이 빌 때만 다음 메시지를 받는다. 기본값(슬롯마다 4개)이면 긴 내보내기
+  # 하나가 잡은 슬롯 뒤에 회신·하트비트가 줄을 서서 다른 슬롯이 비어 있어도 기다린다.
+  worker:
+    command: ["uv","run","--package","worker-io","celery","-A","worker_io.celery_app","worker","-B","-s","/tmp/celerybeat-schedule","-l","info","-Q","q.maiu,q.media,default","-c","${WORKER_CONCURRENCY:-6}","--prefetch-multiplier","1","-O","fair","-n","worker@%h"]
+    stop_grace_period: 60s
+    # 프로세스가 살아 있어도 브로커 연결이 끊긴 워커는 일을 받지 않는다. 노드 이름으로 ping해 응답을 본다.
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/celery -A worker_io.celery_app inspect ping -d worker@$$HOSTNAME -t 10 >/dev/null"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 300s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # q.qc: 캡션 품질검수. 한 건이 모델 응답을 수십 초 기다리는 I/O 대기다.
+  # 투입 상한이 없어(5초마다 최대 50건) 밀린 승인분이 한꺼번에 들어오면 실행 슬롯을 모두 차지한다.
+  # 짧은 작업 워커에 섞으면 회수·하트비트·내보내기가 그 뒤로 밀리므로 따로 둔다.
+  # 필요한 실행 수 ≈ (초당 제출 + 초당 승인) × 검사 1건의 초. 예: 둘의 합이 초당 0.3건이고
+  # 검사가 12초면 3.6이라 기본 4로 충분하다. 모자라면 대기열에 쌓일 뿐 잃지 않는다(투입이 다시 보낸다).
+  # 종료 유예는 진행 중 검사 한 건(모델 호출 상한 60초)을 끝낼 시간이다. 끊겨도 다음 투입이 다시 한다.
+  worker-qc:
+    command: ["uv","run","--package","worker-io","celery","-A","worker_io.celery_app","worker","-l","info","-Q","q.qc","-c","${QC_CONCURRENCY:-4}","--prefetch-multiplier","1","-n","qc@%h"]
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/celery -A worker_io.celery_app inspect ping -d qc@$$HOSTNAME -t 10 >/dev/null"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 300s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # 긴 작업: q.transcode(재생본 인코딩·장면 분할·publish)와 q.deident(비식별화). 한 건이 수십 분이고
+  # GPU가 있으면 GPU를 쓴다(비식별화 추론은 ONNX Runtime CUDA, 변환과 비식별화 결과 인코딩은 NVENC).
+  # 짧은 작업과 같은 풀에 두면 긴 작업 몇 건이 슬롯을 모두 차지해 probe와 콜백이 처리되지 않는다.
+  # 동시 실행 수(GPU_WORKER_CONCURRENCY, 기본 2)는 변환 하나와 비식별화 하나가 같이 도는 수다.
+  # 그 수가 GPU를 쓰는 잡과 동시 NVENC 세션의 최대 수다. 디스패치 상한(TRANSCODE_MAX_INFLIGHT,
+  # DEIDENT_MAX_INFLIGHT)보다 실행 수가 적으면 남는 잡은 큐에서 기다린다. 투입 리스(4시간)는 그 대기 시간까지 포함한다.
+  # prefetch=1: 긴 작업을 미리 받아 두지 않는다. 받아 둔 잡은 다른 실행 슬롯이 비어도 그 자리에서 기다린다.
+  # 이 워커가 없으면 비식별화를 켠 프로젝트의 잡이 소비되지 않아 리스 만료와 재디스패치가 반복된다.
+  # 그래서 프로필 없이 늘 띄운다.
+  # `uv run` 대신 venv의 celery를 직접 부른다. GPU 이미지(worker-gpu.Dockerfile)는 ONNX Runtime을
+  # GPU 런타임으로 바꿔 두는데, `uv run`은 잠금 파일대로 환경을 다시 맞추면서 CPU 런타임을 되돌린다.
+  # GPU를 쓰게 하는 이미지와 장치 예약은 compose.gpu.yaml에 있다.
+  # 시작할 때 6시간 넘은 잡 임시 폴더(/tmp/rb-*)를 지운다. 강제 종료된 잡의 원본·산출이 스크래치 볼륨에
+  # 남아 디스크를 채운다. 기동 직후라 이 컨테이너에는 도는 잡이 없고, 나이 조건은 같은 볼륨을 쓰는
+  # 다른 레플리카의 진행 중인 잡을 지키는 여유다.
+  # 실행 프로세스 20건마다 자식을 새로 만든다(--max-tasks-per-child). 추론 세션과 인코더 라이브러리가
+  # 잡마다 조금씩 남기는 메모리가 GPU·호스트 메모리에 쌓이지 않게 한다.
+  worker-gpu:
+    command: ["sh","-c","find /tmp -maxdepth 1 -name 'rb-*' -mmin +360 -exec rm -rf {} + ; exec /app/.venv/bin/celery -A worker_jobs.celery_app worker -l info -Q q.transcode,q.deident -c ${GPU_WORKER_CONCURRENCY:-2} --prefetch-multiplier 1 --max-tasks-per-child 20 -n gpu@%h"]
+    # 진행 중 1건을 끝내거나 리스를 반납할 시간. 즉시 종료하면 리스 만료(5분)까지 그 영상이 묶인다.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/celery -A worker_jobs.celery_app inspect ping -d gpu@$$HOSTNAME -t 10 >/dev/null"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 300s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # ── 백업 ──────────────────────────────────────────────────────────────────
+  # 운영에서는 늘 뜬다. 백업 버킷과 자격증명은 덮어쓰기 파일이 넘긴다.
+  # 개발 덮어쓰기는 이 서비스를 `backup` 프로필로 묶어 .env에 BACKUP_BUCKET이 있을 때만 띄운다.
+  pg-backup:
+    environment:
+      PGHOST: postgres
+      PGUSER: reborn
+      PGDATABASE: rebornstudio
+      REDIS_HOST: redis
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pg-data:
+  redis-data:

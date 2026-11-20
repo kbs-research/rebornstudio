@@ -1,0 +1,30 @@
+[project]
+name = "worker-io"
+version = "3.1.4"
+description = "RebornStudio Worker IO — Celery beat + MAIU reconciler 호출"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "celery[redis]>=5.4",
+  "api-gateway",     # reconciler 로직 재사용 (workspace dep)
+  "reborn-contracts",  # 태스크 이름·큐 라우팅 표(queues)
+]
+
+[dependency-groups]
+test = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["worker_io"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]

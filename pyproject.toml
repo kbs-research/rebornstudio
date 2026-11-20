@@ -1,0 +1,50 @@
+[project]
+name = "rebornstudio"
+version = "3.1.4"
+description = "한국어 보도영상 VLM 학습 데이터 가공 통합 플랫폼"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.12"
+
+[tool.uv.workspace]
+# 패키지 작성 시점에 점진적으로 추가
+members = [
+  "apps/api-gateway",
+  "packages/reborn-contracts/python",
+  "packages/reborn-transcode",
+  "packages/deident",
+  "workers/worker-io",
+  "workers/worker-jobs",
+]
+
+[tool.uv.sources]
+reborn-contracts = { workspace = true }
+reborn-transcode = { workspace = true }
+essential-deident = { workspace = true }
+api-gateway = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+# B008: FastAPI Depends/Header default 패턴은 의도적 (codebase 전반 사용)
+# N811: `UUID as PgUUID` alias 컨벤션 (postgresql.UUID와 표준 UUID 구분)
+ignore = ["B008", "N811"]
+
+[tool.ruff.lint.per-file-ignores]
+# SQLAlchemy column/CheckConstraint 정의는 한 줄 가독성 유지
+"apps/api-gateway/api_gateway/models/*" = ["E501"]
+# Alembic 마이그: docstring은 의도적으로 한 줄. import 블록은 autogenerate 템플릿 산출물이라 정렬 예외.
+"apps/api-gateway/alembic/versions/*" = ["E501", "I001"]
+# 테스트의 긴 SQL/url 표현 허용
+"apps/api-gateway/tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,305 @@
+# RebornStudio 프로덕션 형상. NCP 서버 한 대 안에 모든 서비스를 둔다.
+#
+# 공통 형상(서비스 목록·워커 큐·의존 순서·헬스 명령·프로필)은 compose.yaml에 있고 이 파일은
+# 운영에서만 다른 것을 덮는다. 이미지·env 전달·로그 회전·재시작·자원 상한이 그렇다.
+#
+# 스토리지(NCP OSS)와 분석(NCP MAIU)이 NCP에 있으므로 컴퓨트도 NCP에 둔다.
+# 트랜스코딩은 원본을 내려받고 산출 2개를 올리므로, 컴퓨트가 다른 클라우드에 있으면
+# 그 왕복이 모두 과금 트래픽이 된다. 스토리지를 NCP 하나로 정한 것과 같은 논리다.
+#
+# 같은 이유로 Postgres·Redis도 이 서버 안에 둔다. DB가 다른 클라우드에 있으면 API 요청 하나가
+# 여러 번 하는 DB 왕복이 모두 클라우드를 건너간다. 스토리지 전송료보다 이쪽 비용이 훨씬 크다.
+#
+# 관리형 DB의 백업·PITR·페일오버는 없다. 백업은 `infra/backup/`이 맡는다. 페일오버가 없으므로
+# 이 서버가 멈추면 서비스도 멈춘다. 규모가 커지면 상태 저장 서비스만 NCP Cloud DB로 옮기는 것이
+# 첫 확장 방향이다(그때 DATABASE_URL 한 줄만 바뀐다).
+#
+#   오브젝트 스토리지: NCP OSS 버킷 하나(원본·파생 전부)
+#   MAIU: NCP Media Intelligence
+#   두 자격증명은 프로젝트가 고른 자격증명 연결(DB에 암호화)이 준다. env로 넘기지 않는다.
+#
+# 이미지는 빌드하지 않고 당긴다. 배포 대상에서 빌드하면 CI가 검증한 것과 다른 산출물이 뜰 수 있고,
+# 빌드가 트랜스코딩과 CPU를 나눠 쓴다. IMAGE_TAG는 CI가 만든 sha 태그(`{name}:sha-<12>`)라서
+# 롤백할 때는 이전 sha로 다시 배포한다.
+#
+# 시크릿은 호스트 env(서버의 /opt/rebornstudio/.env)로만 받는다. 파일이나 하드코딩으로 넣지 않는다.
+#   설정하지 않으면 `${VAR:?}`가 `up`을 바로 실패시킨다. 빈 값으로 떠서 403을 내는 것 같은 조용한 오작동을 막는다.
+#
+# 실행:   infra/deploy/deploy.sh (배포) · infra/deploy/dc.sh <명령> (손으로 볼 때)
+# 검증:   docker compose -f infra/compose/compose.yaml -f infra/compose/compose.prod.yaml config   (VAR 채운 뒤)
+
+# 프로젝트 이름을 고정한다. 볼륨·네트워크 이름(rebornstudio-essential_pg-data 등)이 이 이름에서 나오므로
+# `-p`를 빠뜨린 손 명령이 빈 DB로 새 스택을 띄우지 않게 한다. deploy.sh·dc.sh도 같은 이름을 넘긴다.
+name: rebornstudio-essential
+
+# 컨테이너 로그 회전. docker의 json-file 드라이버는 기본값이 무제한이다.
+# 워커 하나가 celery info 로그를 몇 달 쌓으면 그대로 디스크를 채운다.
+# 디스크가 차면 Redis AOF 쓰기가 실패해 워커가 멈춘다.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+# 앱 공통 env. api·worker·beat가 같은 config.Settings를 읽는다.
+x-app-env: &app-env
+  ENVIRONMENT: ${ENVIRONMENT:-prod}
+  # DB·Redis는 이 서버 안이므로 주소를 env로 받지 않고 비밀번호 하나(POSTGRES_PASSWORD)로 조립한다.
+  # DATABASE_URL을 따로 받으면 postgres 서비스의 비밀번호와 달라질 수 있고,
+  # 그 어긋남은 기동 실패가 아니라 인증 실패로 나타나 원인을 찾기 어렵다.
+  DATABASE_URL: postgresql+asyncpg://reborn:${POSTGRES_PASSWORD:?}@postgres:5432/rebornstudio
+  REDIS_URL: redis://redis:6379/0
+  # NCP 저장소·MI의 주소·버킷·키·워크스페이스는 넘기지 않는다. 프로젝트가 고른 자격증명 연결이 준다.
+  # 실제 MI를 부를지(가짜가 아니라)만 정한다.
+  MAIU_ENABLED: ${MAIU_ENABLED:-true}
+  # MAIU_ENABLED=false로 띄우려면 이 값도 true로 준다. 없으면 config가 기동을 막는다.
+  ALLOW_FAKE_MAIU: ${ALLOW_FAKE_MAIU:-false}
+  # 인증·CORS 시크릿 (prod validator가 기본값·<32자·localhost 거부)
+  JWT_SECRET: ${JWT_SECRET:?}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?}
+  # 연결 자격증명을 DB에 암호화해 저장하는 키. 없으면 prod validator가 import 시점에
+  # 막아 api·워커가 모두 기동에 실패한다.
+  CREDENTIALS_KEY: ${CREDENTIALS_KEY:?}
+  # 키를 바꾸는 동안 복호에만 쓰는 이전 키(쉼표 구분). 평소에는 비어 있다(infra/deploy/README.md의 자격증명 암호화 키 교체 절).
+  CREDENTIALS_KEY_PREVIOUS: ${CREDENTIALS_KEY_PREVIOUS:-}
+  # 로그인 세션의 절대 수명(일). refresh 교체로 늘어나지 않는다.
+  JWT_SESSION_MAX_DAYS: ${JWT_SESSION_MAX_DAYS:-14}
+  # 인증 경로의 분당 한도. IP로는 실패만 세고 인증된 요청은 사용자·세션으로 센다
+  # (services/auth/rate_limit.py). 비우면 config 기본값을 쓴다.
+  RATE_LIMIT_AUTH_PER_MIN: ${RATE_LIMIT_AUTH_PER_MIN:-10}
+  RATE_LIMIT_REFRESH_PER_MIN: ${RATE_LIMIT_REFRESH_PER_MIN:-300}
+  RATE_LIMIT_REFRESH_SESSION_PER_MIN: ${RATE_LIMIT_REFRESH_SESSION_PER_MIN:-60}
+  RATE_LIMIT_CSP_REPORT_PER_MIN: ${RATE_LIMIT_CSP_REPORT_PER_MIN:-60}
+  # 기본은 same-origin이라(web nginx가 /api를 스트립 프록시) 보통 비워 둔다.
+  # FE를 별도 오리진에 둘 때만 채운다. localhost는 validator가 거부한다.
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  # 연결 주소 검사가 막는 내부 호스트 가운데 예외로 받을 호스트(쉼표 구분). 보통 비워 둔다.
+  CONNECTION_HOST_ALLOWLIST: ${CONNECTION_HOST_ALLOWLIST:-}
+  # api가 `X-Forwarded-For`·`X-Forwarded-Proto`를 믿을 프록시(uvicorn 표준 변수). 기본값은 web과 api만 붙는
+  # edge 네트워크의 서브넷 하나다(아래 `networks`). 이 서브넷에서 api에 닿는 컨테이너는 web뿐이다.
+  # 워커처럼 default 네트워크에 있는 컨테이너가 헤더를 꾸며 보내도 그 주소와 scheme은 믿지 않는다.
+  # web nginx가 `X-Forwarded-For`를 자기가 본 주소로 덮어쓰고 `X-Forwarded-Proto`는 믿는 앞단(`WEB_TRUSTED_PROXIES`)이
+  # 보낸 값만 넘기므로, 사용자가 보낸 헤더는 api에 닿지 않는다. 앞단 LB는 이 값이 아니라 `WEB_TRUSTED_PROXIES`에 적는다.
+  # 넓은 대역(172.16.0.0/12 등)으로 되돌리지 않는다. 같은 서버의 다른 컨테이너가 감사 출처와 IP 한도 키를 꾸밀 수 있다.
+  FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-${EDGE_SUBNET:-172.31.250.0/28}}
+  # 한 서버 안이라 커넥션 예산이 빠듯하다. 아래 postgres.max_connections와 같이 본다.
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+  TRANSCODE_MAX_INFLIGHT: ${TRANSCODE_MAX_INFLIGHT:-2}
+  # 비식별화 투입 상한. 투입(worker의 beat 태스크)이 읽는다. 여기 없으면 서버 .env의 값이 가지 않는다.
+  DEIDENT_MAX_INFLIGHT: ${DEIDENT_MAX_INFLIGHT:-1}
+  # 인코딩 1건이 쓸 스레드 수. 컨테이너의 nproc은 cgroup 할당이 아니라
+  # 호스트 코어 수를 본다. 비워 두면 ffmpeg가 스레드를 너무 많이 만들어 문맥 전환으로 손해만 낸다.
+  TRANSCODE_THREADS: ${TRANSCODE_THREADS:-2}
+
+# 워커 공통. 같은 worker-io 이미지를 쓰고, command(소비 큐)는 compose.yaml이 정한다.
+x-worker: &worker
+  image: ${IMAGE_REGISTRY:?}/rebornstudio-worker-io:${IMAGE_TAG:?CI가 만든 sha 태그 필요}
+  restart: always
+  logging: *logging
+  environment: *app-env
+
+# 무DB 잡 워커 env. worker_jobs와 reborn_transcode가 읽는 키만 넘긴다.
+# 잡 워커는 DB에 붙지 않고 토큰을 만들거나 검증하지 않는다. 그래서 DATABASE_URL·JWT 시크릿·
+# CREDENTIALS_KEY를 넘기지 않는다. 잡 컨테이너가 침해되어도 그 컨테이너에는 DB 비밀번호와 암호화 키가 없다.
+# 잡 코드가 새 env를 읽으면 여기에 더한다. 빠지면 그 값은 컨테이너에 가지 않는다.
+x-jobs-env: &jobs-env
+  ENVIRONMENT: ${ENVIRONMENT:-prod}
+  REDIS_URL: redis://redis:6379/0
+
+# 무DB 잡 워커(worker-gpu). worker-jobs 이미지를 쓴다. 태그는 다른 이미지와
+# 같은 sha다. 이 이미지를 빼고 올리면 이 서비스가 pull에서 멈추고 배포 전체가 1단계에서 끝난다.
+x-worker-jobs: &worker-jobs
+  image: ${IMAGE_REGISTRY:?}/rebornstudio-worker-jobs:${IMAGE_TAG:?CI가 만든 sha 태그 필요}
+  restart: always
+  logging: *logging
+  environment: *jobs-env
+
+services:
+  # ── 상태 (이 서버 안) ──────────────────────────────────────────────────────
+  #
+  # 포트를 호스트에 열지 않는다. 같은 compose 네트워크의 서비스만 붙는다.
+  # 서버에 공인 IP가 있으면 5432/6379를 열었을 때 DB와 Redis가 인터넷에 그대로 노출된다.
+  postgres:
+    restart: always
+    logging: *logging
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      # ko_KR 정렬이 필요 없으므로 C 로케일을 쓴다. 인덱스가 빨라지고 초기화가 단순해진다.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    command:
+      - postgres
+      # 커넥션 계산: api 1대 = pool 5 + overflow 10이고,
+      # DB 워커 4종(worker-io)은 태스크마다 NullPool이라 잠깐만 쓴다.
+      # 한 서버라 레플리카가 늘지 않으므로 100이면 넉넉하다.
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    shm_size: 256mb
+
+  redis:
+    restart: always
+    logging: *logging
+    # appendonly: 브로커 큐가 재시작 뒤에도 남아야 한다. 트랜스코딩 잡 하나가 수십 분이라
+    # 큐가 유실되면 그 작업을 처음부터 다시 해야 한다.
+    #
+    # maxmemory는 필수다. 이 서버에서는 Redis와 DB·워커가 메모리를 함께 쓴다. 상한이 없으면 Redis가 메모리를 밀어내
+    # OOM killer가 아무 프로세스나 죽인다.
+    # allkeys-lru가 아니라 noeviction을 쓴다. 브로커 메시지를 조용히 버리면 잡이 사라진다.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-1gb}
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── 배포 단계 one-shot ────────────────────────────────────────────────────
+  #
+  # 실행(배포 절차의 첫 단계이고, 성공한 뒤에만 up한다):
+  #   infra/deploy/dc.sh --profile ops run --rm migrate
+  migrate:
+    image: ${IMAGE_REGISTRY:?}/rebornstudio-api:${IMAGE_TAG:?}
+    environment: *app-env
+
+  # ── 진입 티어 ─────────────────────────────────────────────────────────────
+  # SPA 정적 + /api 스트립 프록시(same-origin). TLS는 이 앞단(NCP LB 또는 호스트
+  # nginx)에서 종료하고 :80으로 포워딩한다.
+  web:
+    image: ${IMAGE_REGISTRY:?}/rebornstudio-web:${IMAGE_TAG:?}
+    restart: always
+    logging: *logging
+    ports: ["80:80"]
+    # nginx는 비 root 사용자로 80을 연다. 이 컨테이너 네트워크 안에서만 1024 미만 포트를 일반 사용자에게 연다.
+    # 도커 기본값과 같지만 다른 런타임에서도 같게 뜨도록 적는다. 호스트의 설정은 바뀌지 않는다.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    # edge 네트워크에만 붙는다. web이 닿을 곳은 api 하나라 DB·Redis가 있는 default 네트워크에 둘 이유가 없다.
+    networks: [edge]
+    environment:
+      # CSP가 여는 저장소 출처(infra/docker/web-csp.sh). 비우면 NCP 객체 저장소 출처다.
+      CSP_STORAGE_ORIGINS: ${CSP_STORAGE_ORIGINS:-}
+      # `X-Forwarded-For`·`X-Forwarded-Proto`를 믿을 앞단 TLS 프록시(infra/docker/web-proxy-trust.sh).
+      # 비우면 아무도 믿지 않는다. 로드밸런서는 그 대역, 같은 서버의 호스트 프록시는 `host`를 적는다.
+      WEB_TRUSTED_PROXIES: ${WEB_TRUSTED_PROXIES:-}
+    # api가 응답하기 전에 web이 뜨면 첫 요청이 502로 끝난다. api 헬스 검사가 통과한 뒤에 띄운다.
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      # localhost는 ::1로 풀릴 수 있는데 nginx는 IPv4만 연다. 그래서 주소를 적는다.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # api 티어. 무상태이고 공유 상태는 모두 Redis에 있다. 호스트 8000은 열지 않는다.
+  # 사용자 트래픽은 web(:80)이 받는다.
+  api:
+    image: ${IMAGE_REGISTRY:?}/rebornstudio-api:${IMAGE_TAG:?}
+    restart: always
+    logging: *logging
+    # default(DB·Redis)와 edge(web) 두 네트워크에 붙는다. web은 edge 주소로 api에 닿는다.
+    networks: [default, edge]
+    environment: *app-env
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── 워커 ──────────────────────────────────────────────────────────────────
+  # 소비 큐(command)는 compose.yaml에 있다. GPU를 쓰게 하는 설정은 compose.gpu.yaml에 있다.
+  worker:
+    <<: *worker
+
+  # q.qc: 캡션 품질검수. 소비 큐와 동시 실행 수(QC_CONCURRENCY)는 compose.yaml에 있다.
+  worker-qc:
+    <<: *worker
+
+  # 긴 작업: q.transcode(인코딩·장면 분할·publish)와 q.deident(비식별화).
+  #
+  # CPU 상한이 이 서버의 안전장치다. 한 대에 DB까지 있으므로 인코딩이나 CPU로 도는 비식별화가
+  # 모든 코어를 쓰면 postgres 응답이 늦어지고 API 전체가 느려진다.
+  #
+  #   GPU_WORKER_CPUS ≈ (전체 vCPU) − (DB·Redis·api·web·다른 워커 몫, 대략 3~4)
+  #   동시 실행 수 = GPU_WORKER_CONCURRENCY (compose.yaml)
+  #
+  # 스크래치 볼륨을 따로 두는 이유: ffmpeg 임시 산출이 컨테이너 쓰기 레이어에 쌓이면
+  # 도커 데이터 디렉터리를 채운다. 디스크가 차면 Redis AOF 쓰기가 실패하고 워커가 멈춘다.
+  #   필요 용량 ≈ (원본 + 산출 2개) × 동시 실행 수
+  worker-gpu:
+    <<: *worker-jobs
+    cpus: ${GPU_WORKER_CPUS:-4}
+    volumes:
+      - transcode-scratch:/tmp
+    environment:
+      <<: *jobs-env
+      TMPDIR: /tmp
+      TRANSCODE_THREADS: ${TRANSCODE_THREADS:-2}
+      # 비우면 기본 모델(essential-yunet)을 쓴다. 등록되지 않은 이름이면 잡이 실패한다.
+      # 여기 없으면 .env에 넣어도 컨테이너에 가지 않는다. prod는 `env_file`이 아니라
+      # `environment:`만 쓴다(compose.dev.yaml과 다른 점).
+      DEIDENT_MODEL: ${DEIDENT_MODEL:-}
+      # 인코더 고정(nvenc·libx264). 비우면 NVENC로 시험 인코딩이 되는지 보고 정한다.
+      TRANSCODE_ENCODER: ${TRANSCODE_ENCODER:-auto}
+      ESSENTIAL_DEIDENT_ENCODER: ${ESSENTIAL_DEIDENT_ENCODER:-auto}
+      # 비식별화 잡 하나의 CPU 스레드(추론·결과 인코딩). 비우면 CPU 상한 ÷ 동시 실행 수다.
+      # 동시 실행 수는 그 분모로 쓰려고 넘긴다(essential_deident.cpu).
+      DEIDENT_THREADS: ${DEIDENT_THREADS:-}
+      GPU_WORKER_CONCURRENCY: ${GPU_WORKER_CONCURRENCY:-2}
+      # OpenMP를 쓰는 라이브러리(numpy·OpenCV 빌드에 따라)가 코어 수만큼 스레드를 만들지 않게 한다.
+      # 추론과 인코딩의 스레드는 위 값이 따로 정한다.
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+
+  # ── 백업 ──────────────────────────────────────────────────────────────────
+  #
+  # DB가 이 서버 안의 컨테이너라서 관리형 DB의 자동 백업이 없다. 이 서비스가 백업을 맡는다.
+  # 논리 백업(pg_dump)을 쓰는 이유: 이 DB는 메타데이터만 담는다(영상·클립 파일은 모두
+  # 오브젝트 스토리지에 있다). 덤프가 작고, 버전이 달라도 복원되며, 한 테이블만 꺼낼 수도 있다.
+  #
+  # 늘 켠다. 백업 버킷과 키가 비면 스택이 뜨지 않는다. 백업 없이 운영하는 상태를 만들지 않기 위해
+  # 설정 단계에서 막는다(deploy.sh가 pull 전에 먼저 확인한다).
+  # 주기 12시간, 보관 30일, 키 접두어는 고정이라 .env로 받지 않는다.
+  #
+  # 성공했을 때만 하트비트(`reborn:beat:pg-backup`)를 남긴다. 진단의 DB 백업 항목이 그 시각으로
+  # 백업이 멈췄는지 판정한다.
+  pg-backup:
+    image: ${IMAGE_REGISTRY:?}/rebornstudio-pgbackup:${IMAGE_TAG:?}
+    restart: always
+    logging: *logging
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?}
+      # 백업 버킷은 산출물 버킷과 나눈다. 라이프사이클 정책이 다르고, 산출물
+      # 버킷을 통째로 지우는 실수가 백업까지 지우면 안 된다.
+      BACKUP_BUCKET: ${BACKUP_BUCKET:?백업 버킷 필요}
+      BACKUP_PREFIX: backups/postgres
+      RETENTION_DAYS: "30"
+      BACKUP_INTERVAL_SECONDS: "43200"
+      # NCP Object Storage 공용 주소·리전. 백업 컨테이너 안의 값이라 서버 .env로 받지 않는다.
+      S3_ENDPOINT: https://kr.object.ncloudstorage.com
+      # 백업은 DB 없이 돌므로 자격증명 연결을 읽지 못한다. NCP 키가 env에 남는 유일한 곳이다.
+      # 백업 버킷 전용 키(BACKUP_*)를 쓴다.
+      AWS_ACCESS_KEY_ID: ${BACKUP_ACCESS_KEY:?백업 버킷 키 필요}
+      AWS_SECRET_ACCESS_KEY: ${BACKUP_SECRET_KEY:?백업 버킷 키 필요}
+      AWS_DEFAULT_REGION: kr-standard
+
+# edge: web과 api만 붙는 네트워크. 서브넷을 고정해 api가 믿을 프록시 대역(`FORWARDED_ALLOW_IPS`)을
+# 이 서브넷 하나로 둔다. 서버의 다른 네트워크와 겹치면 배포가 네트워크 생성에서 멈추므로 그때 `EDGE_SUBNET`으로 바꾼다.
+# 크기 /28은 게이트웨이를 빼고 14개 주소다. web·api가 하나씩 쓴다.
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-172.31.250.0/28}
+
+volumes:
+  transcode-scratch:

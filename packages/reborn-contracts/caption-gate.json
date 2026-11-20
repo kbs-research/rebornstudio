@@ -1,0 +1,213 @@
+{
+  "$comment": "캡션 제출 게이트의 판정 표 — 서버와 화면이 같은 수를 내는지 양쪽 테스트가 이 파일을 읽어 확인한다. 값을 손으로 고치지 말고 두 구현을 고친 뒤 다시 재서 넣는다. 자세한 것은 README의 '캡션 제출 게이트' 절.",
+  "rule": "제출 가능 ⟺ estimate_tokens(final_text(payload)) >= caption_min_tokens",
+  "implementations": {
+    "server": "apps/api-gateway/api_gateway/services/caption.py",
+    "web": "apps/web/src/features/workbench/lib/caption.ts + apps/web/src/features/workbench/lib/tokens.ts"
+  },
+  "tokens": [
+    {
+      "text": "",
+      "expected": 0,
+      "why": "빈 문자열"
+    },
+    {
+      "text": "   \n\t ",
+      "expected": 0,
+      "why": "공백뿐 — 양끝을 걷으면 남는 것이 없다"
+    },
+    {
+      "text": "가",
+      "expected": 1,
+      "why": "한글 1자 → ceil(1/1.5)"
+    },
+    {
+      "text": "짧다.",
+      "expected": 3,
+      "why": "버그가 났던 캡션. 한글 2자에 마침표가 ASCII 낱말 하나로 더 세어진다"
+    },
+    {
+      "text": "뉴스",
+      "expected": 2,
+      "why": "한글 2자 → ceil(2/1.5)"
+    },
+    {
+      "text": "앵커가 뉴스를 전한다",
+      "expected": 6,
+      "why": "한글 9자 → ceil(9/1.5). 공백은 안 센다"
+    },
+    {
+      "text": "news",
+      "expected": 1,
+      "why": "ASCII 낱말 하나"
+    },
+    {
+      "text": "breaking news at nine",
+      "expected": 4,
+      "why": "ASCII 낱말 넷"
+    },
+    {
+      "text": "TV 소식9",
+      "expected": 4,
+      "why": "한글 2자와 ASCII 낱말 둘(TV · 9)이 따로 세어진다"
+    },
+    {
+      "text": "  앞뒤 공백  ",
+      "expected": 3,
+      "why": "양끝 공백은 세기 전에 걷는다"
+    },
+    {
+      "text": "줄바꿈이\n섞인\t캡션",
+      "expected": 6,
+      "why": "줄바꿈·탭도 공백이다"
+    },
+    {
+      "text": "한글과 English가 섞인 caption 문장",
+      "expected": 8,
+      "why": "섞인 문장 — 한글은 글자로, 영문은 낱말로 센다"
+    },
+    {
+      "text": "숨을 고르고　이어 말한다",
+      "expected": 8,
+      "why": "전각 공백(U+3000)은 CJK 구간 안이라 글자로 세어진다 — 양쪽이 같이 그렇다"
+    },
+    {
+      "text": "앵커가 오늘 첫 소식으로 전국에 내린 폭우 피해를 전하고 현장 기자를 연결해 상황을 묻는다. 기자는 하천 수위가 경보선을 넘었다고 답하며 제방 아래 주차장이 물에 잠긴 모습을 보여 준다. 화면 아래에는 대피 안내 자막이 이어진다.",
+      "expected": 65,
+      "why": "기본 기준(50토큰)을 넘는 실제 길이의 캡션 — 통과 쪽 경계"
+    }
+  ],
+  "payloads": [
+    {
+      "payload": {
+        "caption": {
+          "brief": "",
+          "brief_sentences": []
+        }
+      },
+      "text": "",
+      "why": "빈 캡션이 HTTP 200으로 제출되던 버그"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "짧다.",
+          "brief_sentences": [
+            {
+              "id": "t1",
+              "text": "짧다."
+            }
+          ]
+        }
+      },
+      "text": "짧다.",
+      "why": "3자 캡션이 HTTP 200으로 제출되던 버그"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "앵커가 소식을 전한다. 기자가 현장을 보여 준다.",
+          "brief_sentences": [
+            {
+              "id": "s0",
+              "text": "앵커가 소식을 전한다."
+            },
+            {
+              "id": "s1",
+              "text": "기자가 현장을 보여 준다."
+            }
+          ]
+        }
+      },
+      "text": "앵커가 소식을 전한다. 기자가 현장을 보여 준다.",
+      "why": "지금 화면이 보내는 모양 — 살아 있는 문장을 공백 하나로 잇는다"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "앵커가 소식을 전한다.",
+          "brief_sentences": [
+            {
+              "id": "s0",
+              "text": "앵커가 소식을 전한다."
+            },
+            {
+              "id": "s1",
+              "text": "지운 문장입니다.",
+              "deleted": true
+            }
+          ]
+        }
+      },
+      "text": "앵커가 소식을 전한다.",
+      "why": "삭제 표시한 문장은 최종 캡션에 없으므로 게이트도 안 센다"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "무시되는 파생값",
+          "brief_sentences": [
+            {
+              "id": "s0",
+              "text": "배열이 정본이다."
+            }
+          ]
+        }
+      },
+      "text": "배열이 정본이다.",
+      "why": "배열이 있으면 문자열은 쳐다보지 않는다 — 파생이 정본을 이기지 못한다"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "옛 payload는 문자열만 있다.",
+          "brief_sentences": []
+        }
+      },
+      "text": "옛 payload는 문자열만 있다.",
+      "why": "배열이 비면 brief로 떨어진다 — 안 그러면 반려 후 재작업이 영영 막힌다"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief": "배열 자체가 없던 시절."
+        }
+      },
+      "text": "배열 자체가 없던 시절.",
+      "why": "brief_sentences 키가 아예 없는 옛 payload"
+    },
+    {
+      "payload": {
+        "caption": "caption이 문자열이던 시절."
+      },
+      "text": "caption이 문자열이던 시절.",
+      "why": "caption이 문자열이던 옛 모양. `_caption_of`가 적는 사정"
+    },
+    {
+      "payload": {},
+      "text": "",
+      "why": "캡션 칸이 아예 없는 payload"
+    },
+    {
+      "payload": {
+        "caption": null
+      },
+      "text": "",
+      "why": "낯선 모양 하나가 제출을 500으로 만들지 않는다"
+    },
+    {
+      "payload": {
+        "caption": {
+          "brief_sentences": [
+            {
+              "id": "s0",
+              "text": "   "
+            }
+          ]
+        }
+      },
+      "text": "",
+      "why": "공백뿐인 문장은 살아 있지 않다"
+    }
+  ]
+}

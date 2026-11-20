@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+htmlcov/
+
+# pnpm
+.pnpm-store/
+.pnpm-store*
+
+
+# Node
+# 슬래시를 붙이지 않는다. 슬래시를 붙이면 디렉터리만 막아서, 설치본을 심링크로 건
+# node_modules(`ln -s ../../node_modules`)는 파일로 취급되어 커밋된다.
+node_modules
+dist/
+build/
+.turbo/
+.vite/
+
+# Env
+# .env.prod·.env.bak 같은 변형도 시크릿을 담으므로 모두 막고 예시 파일만 남긴다.
+.env
+.env.*
+!.env.example
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Data / Models
+data/
+storage/
+models/*.onnx
+models/*.pt
+models/*.gguf
+!models/.gitkeep
+
+# Generated
+packages/reborn-contracts/typescript/src/_generated/
+packages/reborn-contracts/schemas/*.json
+!packages/reborn-contracts/schemas/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# 전이 산출물 (빌드/스케줄러 캐시)
+*.tsbuildinfo
+celerybeat-schedule*
+
+# terraform. provider 바이너리(648MB)는 푸시를 막고, tfstate에는 자격증명이
+# 들어갈 수 있다. `git add <디렉터리>`로 통째 담으면 함께 딸려 들어간다.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

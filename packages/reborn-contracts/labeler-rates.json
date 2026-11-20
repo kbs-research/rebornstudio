@@ -1,0 +1,73 @@
+{
+  "$comment": "사람별 실적 표의 승인율·반려율 판정 표. 서버는 counts로 row를 내고, 화면은 row로 view를 그린다. 양쪽 테스트가 이 파일을 읽는다. 값을 손으로 고치지 말고 두 구현을 고친 뒤 다시 계산해 넣는다. 자세한 것은 README의 '판정 표는 두 런타임이 함께 읽는다' 절.",
+  "rule": "approval_base = approved + rejected, approval_rate = approved / approval_base * 100 (소수 1자리, base 0이면 null). rejection_base = max(submitted, approved + rejected), rejection_rate = rejected / rejection_base (base 0이면 null). 괄호는 같은 분자와 base를 쓴다.",
+  "implementations": {
+    "server": "apps/api-gateway/api_gateway/services/analytics/dashboard/classify.py (_rate_fields)",
+    "web": "apps/web/src/features/insights/lib/rates.ts (approvalView, rejectionView)"
+  },
+  "cases": [
+    {
+      "counts": { "submitted": 7, "approved": 5, "rejected": 2 },
+      "row": { "approval_rate": 71.4, "approval_base": 7, "rejection_rate": 0.2857142857142857, "rejection_base": 7 },
+      "view": {
+        "approval": { "kind": "rate", "text": "71.4%", "sub": "(5/7)" },
+        "rejection": { "kind": "rate", "text": "28.6%", "sub": "(2/7)" }
+      },
+      "why": "제출을 모두 판정한 보통 행"
+    },
+    {
+      "counts": { "submitted": 50, "approved": 1, "rejected": 1 },
+      "row": { "approval_rate": 50.0, "approval_base": 2, "rejection_rate": 0.02, "rejection_base": 50 },
+      "view": {
+        "approval": { "kind": "rate", "text": "50%", "sub": "(1/2)" },
+        "rejection": { "kind": "rate", "text": "2%", "sub": "(1/50)" }
+      },
+      "why": "검수가 덜 된 행. 반려율은 제출로 나눈다"
+    },
+    {
+      "counts": { "submitted": 4, "approved": 4, "rejected": 0 },
+      "row": { "approval_rate": 100.0, "approval_base": 4, "rejection_rate": 0.0, "rejection_base": 4 },
+      "view": {
+        "approval": { "kind": "rate", "text": "100%", "sub": "(4/4)" },
+        "rejection": { "kind": "rate", "text": "0%", "sub": "(0/4)" }
+      },
+      "why": "모두 승인. 0%는 값이다"
+    },
+    {
+      "counts": { "submitted": 3, "approved": 2, "rejected": 3 },
+      "row": { "approval_rate": 40.0, "approval_base": 5, "rejection_rate": 0.6, "rejection_base": 5 },
+      "view": {
+        "approval": { "kind": "rate", "text": "40%", "sub": "(2/5)" },
+        "rejection": { "kind": "rate", "text": "60%", "sub": "(3/5)" }
+      },
+      "why": "판정이 제출보다 많은 행(기간 전에 낸 작업이 기간 안에 판정됨). 반려율은 판정 수로 나누고 괄호도 같은 수를 쓴다"
+    },
+    {
+      "counts": { "submitted": 0, "approved": 0, "rejected": 18 },
+      "row": { "approval_rate": 0.0, "approval_base": 18, "rejection_rate": 1.0, "rejection_base": 18 },
+      "view": {
+        "approval": { "kind": "rate", "text": "0%", "sub": "(0/18)" },
+        "rejection": { "kind": "rate", "text": "100%", "sub": "(18/18)" }
+      },
+      "why": "제출 0건에 판정만 있는 행. 화면에서 100% (18/0)으로 보이던 결함"
+    },
+    {
+      "counts": { "submitted": 5, "approved": 0, "rejected": 0 },
+      "row": { "approval_rate": null, "approval_base": 0, "rejection_rate": 0.0, "rejection_base": 5 },
+      "view": {
+        "approval": { "kind": "unmeasured", "text": "측정 전", "sub": "판정 없음" },
+        "rejection": { "kind": "rate", "text": "0%", "sub": "(0/5)" }
+      },
+      "why": "제출은 있고 판정이 없는 행. 승인율은 측정 전, 반려율은 제출 대비 0%"
+    },
+    {
+      "counts": { "submitted": 0, "approved": 0, "rejected": 0 },
+      "row": { "approval_rate": null, "approval_base": 0, "rejection_rate": null, "rejection_base": 0 },
+      "view": {
+        "approval": { "kind": "none", "text": "—", "sub": "판정 없음" },
+        "rejection": { "kind": "none", "text": "—", "sub": "제출 없음" }
+      },
+      "why": "제출도 판정도 없는 행. 0으로 나누지 않는다"
+    }
+  ]
+}
